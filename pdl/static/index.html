@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>个人器件库 · PersonalDeviceManagement</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">📦 个人器件库 <span class="ver" id="appVer"></span></div>
+  <nav id="tabs">
+    <button data-tab="library" class="active">器件库</button>
+    <button data-tab="box">器件盒映射</button>
+    <button data-tab="codegen">代码生成</button>
+  </nav>
+  <div class="conn" id="connStatus">
+    <span class="dot" id="connDot"></span><span id="connText">未连接器件盒</span>
+  </div>
+</header>
+
+<main>
+  <!-- ============ 器件库 ============ -->
+  <section id="tab-library" class="tab active">
+    <div class="toolbar">
+      <input id="searchBox" type="search" placeholder="搜索:名称 / C编号 / 描述 / 封装 / 品牌…" autocomplete="off">
+      <select id="sourceFilter">
+        <option value="">全部来源</option>
+        <option value="lcsc">立创导入</option>
+        <option value="manual">手工创建</option>
+      </select>
+      <button id="btnAddDevice" class="primary">＋ 新建器件</button>
+      <button id="btnImport">⬇ 批量导入</button>
+      <button id="btnExport">导出 CSV</button>
+      <span class="spacer"></span>
+      <button id="btnBatchDelete" class="danger">删除选中</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th class="w40"><input type="checkbox" id="checkAll"></th>
+          <th class="w90">C编号</th><th>名称</th><th class="w90">封装</th>
+          <th class="w120">品牌</th><th class="hide-sm">描述</th>
+          <th class="w70">库存</th><th class="hide-sm">备注</th><th class="w110">操作</th>
+        </tr></thead>
+        <tbody id="deviceTbody"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span id="pageInfo" class="muted"></span>
+      <button id="btnPrevPage">‹ 上一页</button>
+      <button id="btnNextPage">下一页 ›</button>
+    </div>
+  </section>
+
+  <!-- ============ 器件盒映射 ============ -->
+  <section id="tab-box" class="tab">
+    <aside class="box-side">
+      <div class="panel">
+        <h3>格栅尺寸 · 动态适配</h3>
+        <div class="row2">
+          <label>行数<input type="number" id="cfgRows" min="1" max="16"></label>
+          <label>列数<input type="number" id="cfgCols" min="1" max="24"></label>
+        </div>
+        <div class="presets">
+          <button data-preset="7x9" class="chip">7×9 = 63</button>
+          <button data-preset="5x7" class="chip">5×7 = 35</button>
+          <button data-preset="4x8" class="chip">4×8 = 32</button>
+          <button data-preset="8x10" class="chip">8×10 = 80</button>
+        </div>
+        <button id="btnApplySize" class="primary wide">应用尺寸</button>
+      </div>
+
+      <div class="panel">
+        <h3>硬件配置(生成固件用)</h3>
+        <div class="row2">
+          <label>LED引脚<input type="number" id="cfgLedPin" min="0" max="48"></label>
+          <label>亮度<input type="number" id="cfgBrightness" min="0" max="255"></label>
+        </div>
+        <label>LED排列
+          <select id="cfgLayout">
+            <option value="serpentine">蛇形 serpentine</option>
+            <option value="row">逐行 row</option>
+          </select>
+        </label>
+        <label>设备名<input type="text" id="cfgDevName" maxlength="30"></label>
+        <div class="row2">
+          <label>上键GPIO<input type="number" id="cfgBtnUp" min="0" max="48"></label>
+          <label>下键GPIO<input type="number" id="cfgBtnDown" min="0" max="48"></label>
+        </div>
+        <div class="row2">
+          <label>左键GPIO<input type="number" id="cfgBtnLeft" min="0" max="48"></label>
+          <label>右键GPIO<input type="number" id="cfgBtnRight" min="0" max="48"></label>
+        </div>
+        <div class="row2">
+          <label>确认键GPIO<input type="number" id="cfgBtnOk" min="0" max="48"></label>
+          <label>OLED SDA<input type="number" id="cfgSda" min="0" max="48"></label>
+        </div>
+        <label>OLED SCL<input type="number" id="cfgScl" min="0" max="48"></label>
+        <button id="btnApplyHw" class="primary wide">保存硬件配置</button>
+      </div>
+
+      <div class="panel">
+        <h3>器件盒连接(联动)</h3>
+        <select id="portSelect"></select>
+        <div class="btnrow">
+          <button id="btnRefreshPorts">刷新</button>
+          <button id="btnConnect" class="primary">连接</button>
+          <button id="btnDisconnect">断开</button>
+        </div>
+        <button id="btnSyncNow" class="wide">⟳ 同步映射到硬件</button>
+        <div id="simPanel" class="hidden sim">
+          <h4>虚拟盒模拟操作</h4>
+          <div class="btnrow">
+            <button data-sim="take">模拟取料</button>
+            <button data-sim="return">模拟退料</button>
+            <button data-sim="move">模拟移动</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="box-main">
+      <div class="box-head">
+        <h2 id="boxTitle">器件盒</h2>
+        <span class="spacer"></span>
+        <button id="btnAutoArrange">⚡ 一键排布</button>
+        <button id="btnClearBox" class="danger">清空映射</button>
+      </div>
+      <div id="grid" class="grid"></div>
+      <div id="cellPanel" class="panel hidden">
+        <h3 id="cellTitle">格位</h3>
+        <div id="cellInfo" class="cellinfo"></div>
+        <div class="btnrow">
+          <button id="btnPickDevice" class="primary">分配 / 更换器件</button>
+          <button id="btnLightCell">💡 点亮测试</button>
+          <button id="btnTakeCell">取料 −1</button>
+          <button id="btnClearCell" class="danger">解除映射</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 代码生成 ============ -->
+  <section id="tab-codegen" class="tab">
+    <aside class="codegen-side">
+      <div class="panel">
+        <h3>生成 ESP32 固件工程</h3>
+        <p class="muted">按软件中配置的映射关系自动生成完整 PlatformIO 工程,
+          <b>无需手动修改任何代码</b>。改完映射回这里重新生成即可。</p>
+        <label>输出目录
+          <input type="text" id="outputDir" placeholder="例如 D:\Pre\Masterpiece\MyBoxFirmware">
+        </label>
+        <button id="btnGenerate" class="primary wide">⚙ 生成固件工程</button>
+        <div id="genResult"></div>
+      </div>
+      <div class="panel sec">
+        <h3>🛡 软件层 ↔ 代码层 安全机制</h3>
+        <ul class="sec-list">
+          <li>所有输入白名单校验:名称字符集、C编号格式、GPIO范围、尺寸上限</li>
+          <li>写入代码的字符串全部 C 转义,无法逃逸出字符串字面量</li>
+          <li>过滤控制字符与 Unicode 双向控制符(防特洛伊源码)</li>
+          <li>生成结果整体扫描危险片段后才允许写盘</li>
+          <li>输出目录保护:禁止写入程序目录,非空目录需为已生成固件</li>
+        </ul>
+      </div>
+    </aside>
+    <div class="codegen-main">
+      <div class="box-head">
+        <h2>box_config.h 实时预览</h2>
+        <span class="muted" id="previewSha"></span>
+      </div>
+      <pre id="codePreview" class="code">加载中…</pre>
+    </div>
+  </section>
+</main>
+
+<!-- 弹窗 -->
+<div id="modalMask" class="modal-mask hidden"><div class="modal" id="modalBox"></div></div>
+<div id="toasts"></div>
+<footer><span id="eventTicker">事件日志就绪</span></footer>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
