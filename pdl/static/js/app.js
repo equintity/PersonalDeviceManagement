@@ -14,7 +14,11 @@
 
   /* ================= 基础设施 ================= */
   async function api(path, opts = {}) {
-    const init = { method: opts.method || "GET", headers: {} };
+    // 带请求体(json/form)时默认 POST;GET/HEAD 不允许携带 body
+    const init = {
+      method: opts.method || (opts.json !== undefined || opts.form ? "POST" : "GET"),
+      headers: {},
+    };
     if (opts.json !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(opts.json);
