@@ -1,0 +1,8 @@
+# PersonalDeviceManagement 本地个人器件库
+# Python >= 3.10,全部为纯 Python 依赖,无编译负担
+flask>=3.0
+openpyxl>=3.1
+pyserial>=3.5
+
+# 可选:支持旧版 .xls 订单文件(立创商城导出)
+# xlrd>=2.0.1

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# 应用运行期数据(器件库数据库、上传文件)
+data/
+uploads/
+*.db
+*.db-wal
+*.db-shm
+
+# 代码生成输出(由软件生成到用户指定目录)
+firmware/generated/
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时与日志
+*.log
+tmp/
