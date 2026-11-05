@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .. import security
 from ..db import utc_now
+from ..paths import as_resources
 from . import boxmap
 
 APP_VERSION = "1.0.0"
@@ -183,12 +184,16 @@ def preview(project_root) -> dict:
 
 
 def generate(project_root, output_dir: Path) -> dict:
-    """生成完整可编译的 PlatformIO 固件工程到 output_dir。"""
-    output_dir = security.validate_output_dir(str(output_dir), app_root=project_root)
+    """生成完整可编译的 PlatformIO 固件工程到 output_dir。
+
+    project_root 接受资源根或 AppPaths:模板取资源根,防覆盖判定用资源根。
+    """
+    resources_root = as_resources(project_root)
+    output_dir = security.validate_output_dir(str(output_dir), app_root=resources_root)
     header = render_box_config_header(project_root)  # 校验失败在这里先爆
     readme = render_output_readme(project_root)
 
-    template_dir = project_root / "firmware" / "template"
+    template_dir = resources_root / "firmware" / "template"
     if not (template_dir / "platformio.ini").exists():
         raise RuntimeError("固件模板缺失,请重新安装程序")
 

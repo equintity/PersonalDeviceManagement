@@ -14,6 +14,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .paths import as_data
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,13 +80,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def db_path(project_root: Path) -> Path:
-    return project_root / "data" / "pdl.db"
+def db_path(root) -> Path:
+    """数据库文件位置:接受 Path 或 AppPaths(取其数据根)。"""
+    return as_data(root) / "data" / "pdl.db"
 
 
-def get_db(project_root: Path) -> sqlite3.Connection:
+def get_db(root) -> sqlite3.Connection:
     """获取(线程, 数据库路径)维度的连接(WAL 模式,支持多线程)。"""
-    path = str(db_path(project_root))
+    path = str(db_path(root))
     key = (threading.get_ident(), path)
     conn = _connections.get(key)
     if conn is not None:
@@ -99,8 +102,8 @@ def get_db(project_root: Path) -> sqlite3.Connection:
     return conn
 
 
-def init_db(project_root: Path) -> sqlite3.Connection:
-    conn = get_db(project_root)
+def init_db(root) -> sqlite3.Connection:
+    conn = get_db(root)
     conn.executescript(_SCHEMA)
     # 器件盒配置单行表:确保存在一行默认配置(默认 7x9 格栅)
     row = conn.execute("SELECT id FROM box_config WHERE id = 1").fetchone()

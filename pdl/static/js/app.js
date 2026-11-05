@@ -550,10 +550,40 @@
       const info = await api("/system/info");
       $("appVer").textContent = `v${info.version}`;
     } catch { /* 忽略 */ }
+    setupDesktopShell();
     await loadDevices();
     await loadBox();
     fillConfigForm();
     await refreshPorts();
     await pollEvents();
   })();
+
+  /* ================= 桌面外壳集成 =================
+   * 桌面模式由启动器以 ?shtoken=<随机令牌> 打开页面:
+   * - 每 2s 上报心跳,所有页面关闭后由启动器看门狗退出应用;
+   * - 顶栏显示「退出」按钮(POST /system/shutdown,令牌保护)。
+   * 源码/服务器模式无令牌,两个端点均被后端拒绝,本段自动跳过。 */
+  function setupDesktopShell() {
+    const token = new URLSearchParams(location.search).get("shtoken") || "";
+    if (!token) return;
+    setInterval(() => {
+      fetch("/api/system/heartbeat", { method: "POST",
+        headers: { "X-PDL-Token": token } }).catch(() => {});
+    }, 2000);
+    const quit = document.createElement("button");
+    quit.textContent = "退出程序";
+    quit.style.marginLeft = "10px";
+    quit.addEventListener("click", async () => {
+      if (!confirm("退出个人器件库?")) return;
+      try { await fetch("/api/system/shutdown", { method: "POST",
+        headers: { "X-PDL-Token": token } }); } catch { /* 服务已停 */ }
+      document.title = "已退出,可关闭此窗口";
+      document.body.innerHTML = "";
+      const tip = document.createElement("p");
+      tip.textContent = "应用已退出,可以关闭本窗口。";
+      tip.style.cssText = "font-size:20px;padding:60px;text-align:center";
+      document.body.appendChild(tip);
+    });
+    document.querySelector(".conn").appendChild(quit);
+  }
 })();

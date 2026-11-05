@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request, send_file
 
 from . import security
+from .db import db_path
+from .paths import as_data
 from .services import boxmap, codegen, devices as device_service, importer
 from .services.serial_bridge import BridgeError, SerialBridge
 
@@ -60,10 +63,13 @@ def _bridge() -> SerialBridge:
 # ---------------------------------------------------------------------------
 # 系统
 # ---------------------------------------------------------------------------
+def _shutdown_token() -> str | None:
+    return _ctx.get("shutdown_token")
+
+
 @bp.get("/system/info")
 def system_info():
-    root = _root()
-    db_file = root / "data" / "pdl.db"
+    db_file = db_path(_root())
     return _ok({
         "app": "PersonalDeviceManagement",
         "version": codegen.APP_VERSION,
@@ -74,6 +80,32 @@ def system_info():
             "max_cells": security.MAX_CELLS, "max_name_len": security.MAX_NAME_LEN,
         },
     })
+
+
+@bp.post("/system/heartbeat")
+def system_heartbeat():
+    """桌面外壳保活心跳:令牌匹配才有效,用于“所有页面都关闭则退出”。"""
+    expected = _shutdown_token()
+    token = request.headers.get("X-PDL-Token", "")
+    if not expected or token != expected:
+        return _fail("令牌无效", 403)
+    _ctx["last_heartbeat"] = time.time()
+    return _ok({"alive": True})
+
+
+@bp.post("/system/shutdown")
+def system_shutdown():
+    """桌面外壳主动退出:需要启动器注入的随机令牌,防止任何网页恶意关闭/操控。"""
+    expected = _shutdown_token()
+    if not expected:
+        return _fail("该运行模式不支持远程关闭", 403)
+    token = request.headers.get("X-PDL-Token", "")
+    if token != expected:
+        return _fail("令牌无效", 403)
+    evt = _ctx.get("shutdown_event")
+    if evt is not None:
+        evt.set()
+    return _ok({"bye": True})
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +153,9 @@ def devices_adjust(device_id: int):
 # 导入 / 导出
 # ---------------------------------------------------------------------------
 def _save_uploads(files) -> list[dict]:
-    """保存上传文件到 uploads/(随机名),返回 [{path, filename}]。"""
-    upload_dir = _root() / "uploads"
-    upload_dir.mkdir(exist_ok=True)
+    """保存上传文件到数据目录 uploads/(随机名),返回 [{path, filename}]。"""
+    upload_dir = as_data(_root()) / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     for fs in files:
         if not fs or not fs.filename:
