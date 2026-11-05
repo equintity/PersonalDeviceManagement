@@ -102,6 +102,19 @@ td .desc { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-sp
 .qty-badge.zero { color: var(--err); border-color: var(--err); }
 .src-tag { font-size: 11px; color: var(--fg-dim); border: 1px solid var(--line);
   border-radius: 9px; padding: 0 6px; margin-left: 5px; white-space: nowrap; }
+.price-cell { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.price-cell .cur { color: var(--fg-dim); font-size: 10px; margin-right: 2px; }
+.p-badge { display: inline-block; font-size: 10px; border-radius: 8px;
+  padding: 0 6px; margin-left: 4px; border: 1px solid var(--line);
+  color: var(--fg-dim); white-space: nowrap; }
+.p-badge.ok { color: var(--ok); border-color: var(--ok); }
+.p-badge.no_match { color: var(--warn); border-color: var(--warn); }
+.p-badge.discontinued { color: var(--err); border-color: var(--err); }
+.p-badge.error { color: var(--err); border-color: var(--err); }
+.sum-list { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+.sum-list li { margin: 3px 0; }
+.sum-sec { margin-top: 10px; }
+.sum-sec h4 { margin: 0 0 4px; font-size: 12px; }
 .w40{width:40px} .w70{width:70px} .w90{width:90px} .w110{width:110px} .w120{width:120px}
 .pager { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 @media (max-width: 900px) { .hide-sm { display: none; } }

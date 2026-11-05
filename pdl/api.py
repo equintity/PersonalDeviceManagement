@@ -18,7 +18,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 from . import security
 from .db import db_path
 from .paths import as_data
-from .services import boxmap, codegen, devices as device_service, importer
+from .services import boxmap, codegen, devices as device_service, importer, prices
 from .services.serial_bridge import BridgeError, SerialBridge
 
 bp = Blueprint("api", __name__, url_prefix="/api")
@@ -283,6 +283,22 @@ def codegen_generate():
     body = _body()
     result = codegen.generate(_root(), body.get("output_dir", ""))
     return _ok(result)
+
+
+# ---------------------------------------------------------------------------
+# 价格更新(需求:按型号/C编号批量刷新,标记无匹配与已下架)
+# ---------------------------------------------------------------------------
+@bp.post("/prices/refresh")
+def prices_refresh():
+    body = _body()
+    ids = body.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        raise security.ValidationError("ids 必须是数组")
+    scope = body.get("scope", "selected" if ids else "all")
+    if not isinstance(scope, str):
+        raise security.ValidationError("scope 必须是字符串")
+    return _ok(prices.refresh_prices(_root(), ids=ids,
+                                     scope=scope.lower() if scope else "all"))
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,9 @@ _NAME_RE = re.compile(
 
 _LCSC_CODE_RE = re.compile(r"^[Cc]\d{1,8}$")
 
+# 器件型号(MPN):字母数字开头,可含 . _ / - 与空格,1~50 字符
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9./_\- ]{0,49}$")
+
 # 生成代码中绝对不允许出现的词(深度防御,生成后扫描)
 _FORBIDDEN_IN_CODE = ("__attribute__", "asm(", "asm volatile", "system(", "#include <")
 
@@ -152,6 +155,21 @@ def validate_lcsc_code(value) -> str | None:
     if not _LCSC_CODE_RE.match(code):
         raise ValidationError(f"C编号格式错误:{value!r}(应为 C+数字,如 C25704)")
     return code
+
+
+def validate_model(value) -> str:
+    """器件型号(MPN):用于无 C 编号时按型号匹配价格;允许空串。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError("型号必须是字符串")
+    text = _CONTROL_RE.sub("", value).strip()
+    if not text:
+        return ""
+    if len(text) > 50 or not _MODEL_RE.match(text):
+        raise ValidationError(
+            "型号格式错误:应以字母/数字开头,仅含字母数字与 . _ / - 空格,≤50 字符")
+    return text
 
 
 def validate_int(

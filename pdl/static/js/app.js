@@ -88,10 +88,11 @@
           <td><input type="checkbox" class="row-check" data-id="${d.id}"></td>
           <td><span class="code-chip">${esc(d.lcsc_code || "—")}</span>
               <span class="src-tag">${d.source === "lcsc" ? "立创" : "手工"}</span></td>
-          <td><span class="name" title="${esc(d.name)}">${esc(d.name)}</span></td>
+          <td><span class="name" title="${esc(d.model ? "型号:" + d.model + " · " : "")}${esc(d.name)}">${esc(d.name)}</span></td>
           <td>${esc(d.package || "—")}</td>
           <td>${esc(d.manufacturer || "—")}</td>
           <td class="hide-sm"><span class="desc" title="${esc(d.description)}">${esc(d.description || "—")}</span></td>
+          <td>${renderPrice(d)}</td>
           <td><span class="qty-badge ${qtyCls}" data-qty="${d.id}" title="点击修改库存">${d.qty}</span></td>
           <td class="hide-sm"><span class="desc">${esc(d.notes || "")}</span></td>
           <td>
@@ -102,6 +103,26 @@
     }
     const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
     $("pageInfo").textContent = `共 ${state.total} 件 · 第 ${state.page}/${pages} 页`;
+  }
+
+  function renderPrice(d) {
+    const badges = {
+      ok: "已更新", no_match: "无匹配", discontinued: "已下架", error: "失败",
+    };
+    let html = '<span class="price-cell">';
+    if (d.price !== null && d.price !== undefined && d.price !== "") {
+      const cur = d.price_currency || "";
+      const sym = cur === "USD" ? "$" : cur === "CNY" ? "¥" : "";
+      html += `<span class="cur">${sym || esc(cur)}</span>${d.price}`;
+    } else {
+      html += '<span class="cur">—</span>';
+    }
+    if (d.price_status && badges[d.price_status]) {
+      const when = d.price_updated_at ? ` · ${d.price_updated_at.slice(0, 16).replace("T", " ")} UTC` : "";
+      const src = d.price_source === "lcsc" ? "立创" : d.price_source === "jlcpcb" ? "JLC" : "";
+      html += `<span class="p-badge ${d.price_status}" title="${esc(badges[d.price_status])}${when}${src ? " · 来源:" + src : ""}">${badges[d.price_status]}</span>`;
+    }
+    return html + "</span>";
   }
 
   $("deviceTbody").addEventListener("click", async (e) => {
@@ -177,6 +198,9 @@
       </div>
       <label>器件名称 *<input id="mName" value="${esc(dev?.name || "")}" maxlength="64"
         placeholder="如 100nF 50V X7R 0603 或 STM32F103C8T6"></label>
+      <label>型号 MPN(可选,价格更新时用于匹配)
+        <input id="mModel" value="${esc(dev?.model || "")}" maxlength="50"
+        placeholder="如 NTMFS5C430NLT1G"></label>
       <div class="row2">
         <label>分类<input id="mCat" value="${esc(dev?.category || "")}" placeholder="电容/MCU/连接器…"></label>
         <label>封装<input id="mPkg" value="${esc(dev?.package || "")}" placeholder="0603/LQFP48…"></label>
@@ -204,6 +228,7 @@
       }
       const body = {
         lcsc_code: m.querySelector("#mCode").value.trim(),
+        model: m.querySelector("#mModel").value.trim(),
         name: m.querySelector("#mName").value.trim(),
         qty: Number(m.querySelector("#mQty").value || 0),
         category: m.querySelector("#mCat").value.trim(),
@@ -272,6 +297,68 @@
       btn.disabled = false; btn.textContent = "开始导入";
     });
   });
+
+  /* ---- 价格批量刷新(需求:型号匹配/批量刷新/无匹配与下架标记/摘要) ---- */
+  $("btnRefreshPrices").addEventListener("click", () => {
+    const selCount = state.selectedIds.size;
+    const m = openModal(`
+      <h3>⟳ 批量刷新器件价格</h3>
+      <label>刷新范围
+        <select id="prScope">
+          <option value="all">全部器件(单批最多 100,可多次执行)</option>
+          ${selCount ? `<option value="selected">仅选中的 ${selCount} 件</option>` : ""}
+          <option value="stale">仅未刷新 / 无匹配 / 失败的器件</option>
+        </select>
+      </label>
+      <p class="muted">数据来源:有 C 编号 → 立创接口精确查询(含下架状态);
+        无 C 编号 → 按型号在 JLCPCB 库<b>严格相等</b>匹配,命中自动回填 C 编号。
+        无匹配与已下架器件会标记在价格列。价格为接口币种(通常 USD)。</p>
+      <div class="actions">
+        <button id="prCancel">取消</button>
+        <button id="prGo" class="primary">开始刷新</button>
+      </div>`);
+    m.querySelector("#prCancel").addEventListener("click", closeModal);
+    m.querySelector("#prGo").addEventListener("click", async () => {
+      const scope = m.querySelector("#prScope").value;
+      const btn = m.querySelector("#prGo");
+      btn.disabled = true; btn.textContent = "刷新中(含限速,请稍候)…";
+      try {
+        const ids = scope === "selected" ? [...state.selectedIds] : undefined;
+        const r = await api("/prices/refresh", { json: { scope, ids } });
+        closeModal();
+        showPriceSummary(r);
+        loadDevices();
+      } catch (err) {
+        toast(`刷新失败:${err.message}`, "err");
+        btn.disabled = false; btn.textContent = "开始刷新";
+      }
+    });
+  });
+
+  function showPriceSummary(r) {
+    const li = (items, fmt) => items.length
+      ? `<ul class="sum-list">${items.map((x) => `<li>${fmt(x)}</li>`).join("")}</ul>`
+      : `<p class="muted" style="margin:2px 0">无</p>`;
+    const money = (x) => x.currency === "USD" ? `$${x.price}` :
+      x.currency === "CNY" ? `¥${x.price}` : `${x.price} ${x.currency || ""}`;
+    const html = `
+      <h3>价格刷新结果摘要</h3>
+      <p>范围 <b>${esc(r.scope)}</b> · 共处理 <b>${r.requested}</b> 件 · 耗时 ${(r.elapsed_ms / 1000).toFixed(1)}s
+        ${r.more_left ? '<span class="muted">(还有更多,可再次执行)</span>' : ""}</p>
+      <div class="sum-sec"><h4 style="color:var(--ok)">✔ 已更新价格(${r.updated.length})</h4>
+        ${li(r.updated, (x) => `${esc(x.name)}:${money(x)}${x.matched_code ? ` <span class="code-chip">${esc(x.matched_code)}</span>` : ""}`)}</div>
+      <div class="sum-sec"><h4 style="color:var(--warn)">⚠ 无匹配(${r.no_match.length})</h4>
+        ${li(r.no_match, (x) => `${esc(x.name)}${x.reason ? ` —— ${esc(x.reason)}` : ""}`)}</div>
+      <div class="sum-sec"><h4 style="color:var(--err)">⛔ 已下架 / 停售(${r.discontinued.length})</h4>
+        ${li(r.discontinued, (x) => `${esc(x.name)}${x.cycle ? ` —— 状态:${esc(x.cycle)}` : ""}`)}</div>
+      <div class="sum-sec"><h4 style="color:var(--err)">✘ 失败(${r.failed.length})</h4>
+        ${li(r.failed, (x) => `${esc(x.name)} —— ${esc(x.error || "网络异常")}`)}</div>
+      <div class="sum-sec"><h4>– 跳过(无 C 编号且无型号,${r.skipped.length})</h4>
+        ${li(r.skipped, (x) => esc(x.name))}</div>
+      <div class="actions"><button id="sumClose" class="primary">知道了</button></div>`;
+    const box = openModal(html);
+    box.querySelector("#sumClose").addEventListener("click", closeModal);
+  }
 
   /* ================= 器件盒映射(需求 2、3) ================= */
   async function loadBox() {

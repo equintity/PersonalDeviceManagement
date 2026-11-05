@@ -45,6 +45,24 @@ import_logs(kind, detail, imported, merged, skipped, errors, created_at)
 真实硬件仅替换 VirtualBox 为 pyserial 连接,处理路径完全一致(测试
 `test_full_linkage_loop` 覆盖)。
 
+## 价格数据源调研(2026-11 实测)
+
+| 名称 | 类型 | 可用性 | 功能 | 限制 |
+|---|---|---|---|---|
+| LCSC 官方开放 API(lcsc.com/docs) | 官方 REST,需申请 key/secret 签名 | 需企业申请 | 品类/器件列表业务数据 | 个人门槛高,本项目未采用(预留升级路径) |
+| `wmsc.lcsc.com/ftps/wm/product/detail` | 嘉立创EDA 前端逆向接口 | **本机实测可用** | 按 C 编号精确查:价格梯度(USD)、库存、`productCycle` 生命周期、型号/品牌/封装 | 非官方契约可能变化;价格为国际站 USD;需自限速 |
+| JLCPCB `selectSmtComponentList/v2` | JLCPCB SMT 器件库接口 | **本机实测可用** | keyword 搜索:componentModelEn/componentCode/价格梯度/stockCount/基础-扩展库 | 仅覆盖 JLCPCB 贴片库子集;USD;库存为 JLCPCB 仓 |
+| kicad-jlcpcb-tools(Bouni) | KiCad 插件 | — | BOM/CPL、C 编号匹配、器件库查询 | KiCad 专用,不对外开放库 |
+| easyeda2kicad(uPesy) | Python 库/CLI | — | LCSC/EasyEDA 符号/封装/3D 模型 | 面向 CAD,价格数据有限 |
+| jlcparts(yaqwsx) | 网站数据库 | — | JLCPCB 库全量快照检索 | 快照非实时 |
+| so.szlcsc.com 搜索 | 国内商城搜索 | **实测被 WAF 拦截** | — | 不可用 |
+| wmsc.szlcsc.com | 国内商城接口 | **实测无响应** | — | 不可用 |
+
+实现取前两个可用源,策略:有 C 编号走 LCSC 详情(精确 + 生命周期),
+无 C 编号按型号走 JLCPCB 搜索(componentModelEn 严格相等,命中回填 C 编号)。
+两个端点均支持环境变量覆盖(`PDL_LCSC_DETAIL_API` / `PDL_JLCPCB_SEARCH_API`
+在 `pdl/services/prices.py` 中定义常量),若日后失效可快速切换。
+
 ## 已知取舍
 
 - 映射烧录在固件配置头里,改映射需重新生成 + 烧录(换来"零手写代码");

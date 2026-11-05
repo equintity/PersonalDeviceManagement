@@ -11,7 +11,7 @@ import sqlite3
 from .. import security
 from ..db import get_db, row_to_device, utc_now
 
-_DEVICE_FIELDS = ("name", "category", "package", "manufacturer", "description", "notes")
+_DEVICE_FIELDS = ("category", "package", "manufacturer", "description", "notes")
 
 
 def _validate_attrs(attrs) -> dict:
@@ -102,6 +102,7 @@ def list_devices(
 def create_device(project_root, data: dict) -> dict:
     name = security.validate_device_name(data.get("name"))
     code = security.validate_lcsc_code(data.get("lcsc_code"))
+    model = security.validate_model(data.get("model"))
     qty = security.validate_int(data.get("qty", 0), field="库存数量", min_val=0, max_val=security.MAX_QTY)
     attrs = _validate_attrs(data.get("attrs"))
     price = _validate_price(data.get("price"))
@@ -111,10 +112,10 @@ def create_device(project_root, data: dict) -> dict:
     conn = get_db(project_root)
     try:
         cur = conn.execute(
-            "INSERT INTO devices (lcsc_code, name, category, package, manufacturer,"
+            "INSERT INTO devices (lcsc_code, model, name, category, package, manufacturer,"
             " description, qty, price, notes, attrs, source, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (code, name, fields["category"], fields["package"], fields["manufacturer"],
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (code, model, name, fields["category"], fields["package"], fields["manufacturer"],
              fields["description"], qty, price, fields["notes"],
              json.dumps(attrs, ensure_ascii=False), "manual", now, now),
         )
@@ -138,6 +139,9 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
     if "lcsc_code" in data:
         updates.append("lcsc_code = ?")
         params.append(security.validate_lcsc_code(data.get("lcsc_code")))
+    if "model" in data:
+        updates.append("model = ?")
+        params.append(security.validate_model(data.get("model")))
     if "qty" in data:
         updates.append("qty = ?")
         params.append(security.validate_int(data.get("qty", 0), field="库存数量",

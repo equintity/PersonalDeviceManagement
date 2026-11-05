@@ -31,6 +31,7 @@
       </select>
       <button id="btnAddDevice" class="primary">＋ 新建器件</button>
       <button id="btnImport">⬇ 批量导入</button>
+      <button id="btnRefreshPrices">⟳ 刷新价格</button>
       <button id="btnExport">导出 CSV</button>
       <span class="spacer"></span>
       <button id="btnBatchDelete" class="danger">删除选中</button>
@@ -40,8 +41,9 @@
         <thead><tr>
           <th class="w40"><input type="checkbox" id="checkAll"></th>
           <th class="w90">C编号</th><th>名称</th><th class="w90">封装</th>
-          <th class="w120">品牌</th><th class="hide-sm">描述</th>
-          <th class="w70">库存</th><th class="hide-sm">备注</th><th class="w110">操作</th>
+          <th class="w110">品牌</th><th class="hide-sm">描述</th>
+          <th class="w110">价格</th><th class="w70">库存</th>
+          <th class="hide-sm">备注</th><th class="w110">操作</th>
         </tr></thead>
         <tbody id="deviceTbody"></tbody>
       </table>

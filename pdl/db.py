@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS import_logs (
 );
 """
 
+# 增量迁移:旧库补列(幂等)
+_MIGRATION_COLUMNS = {
+    "devices": {
+        "model": "TEXT NOT NULL DEFAULT ''",            # 型号(MPN),用于无C编号时的价格匹配
+        "price_currency": "TEXT NOT NULL DEFAULT ''",   # 价格币种:''=用户手填(未标注),USD/CNY=接口来源
+        "price_status": "TEXT NOT NULL DEFAULT ''",     # ''未刷新 / ok / no_match / discontinued / error
+        "price_updated_at": "TEXT",                     # 最近一次价格刷新时间(UTC)
+        "price_source": "TEXT NOT NULL DEFAULT ''",     # lcsc / jlcpcb
+    },
+}
+
 _connections: dict[tuple[int, str], sqlite3.Connection] = {}
 
 
@@ -105,12 +116,23 @@ def get_db(root) -> sqlite3.Connection:
 def init_db(root) -> sqlite3.Connection:
     conn = get_db(root)
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     # 器件盒配置单行表:确保存在一行默认配置(默认 7x9 格栅)
     row = conn.execute("SELECT id FROM box_config WHERE id = 1").fetchone()
     if row is None:
         conn.execute("INSERT INTO box_config (id) VALUES (1)")
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """幂等的增量列迁移(PRAGMA table_info 检查后 ALTER TABLE)。"""
+    for table, columns in _MIGRATION_COLUMNS.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, ddl in columns.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    conn.commit()
 
 
 def row_to_device(row: sqlite3.Row) -> dict:
