@@ -27,3 +27,8 @@ desktop.ini
 # 临时与日志
 *.log
 tmp/
+
+# 桌面版构建产物
+build/
+dist/
+release/
