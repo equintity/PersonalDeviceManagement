@@ -283,7 +283,7 @@
         </div>
         <h4 style="margin-top:16px">方式二:C 编号一键加载(推荐)</h4>
         <p class="muted" style="margin:4px 0">手动录入或批量粘贴 C 编号(每行一个),
-          系统自动补全名称/型号/封装/品牌/价格/库存,可在保存前逐项修改。</p>
+          系统自动补全名称/型号/封装/品牌/价格;库存默认 1,请改为你的实际持有量(商城现货仅作参考)。</p>
         <textarea id="impCodes" placeholder="C25704&#10;C2040&#10;C8734"></textarea>
         <div id="impProgress" class="muted" style="margin-top:6px"></div>
         <div class="actions">
@@ -347,6 +347,8 @@
       const body = rows.map((r, idx) => {
         const locked = r.status === "exists";   // 已存在:人工字段不覆盖,锁定编辑
         const off = r.status !== "new" && r.status !== "exists";
+        const mallHint = r.mall_stock !== undefined && r.mall_stock !== null
+          ? `<div class="muted" style="font-size:10px">商城现货 ${r.mall_stock}</div>` : "";
         return `<tr class="${off ? "pv-off" : ""}">
           <td><span class="code-chip">${esc2(r.code)}</span>${statusChip(r.status)}
             ${r.status === "exists" ? `<div class="muted" style="font-size:10px">库内 ${r.exists_qty} 件,保存时合并</div>` : ""}
@@ -356,7 +358,7 @@
           <td>${editable(idx, "package", r.package, off)}</td>
           <td>${editable(idx, "manufacturer", r.manufacturer, off)}</td>
           <td>${off ? "—" : editable(idx, "price", r.price ?? "", false)}</td>
-          <td>${off ? "—" : editable(idx, "qty", r.qty, false)}</td>
+          <td>${off ? "—" : editable(idx, "qty", r.qty, false)}${off ? "" : mallHint}</td>
           <td><button class="pv-del" data-idx="${idx}" title="移除此行">✕</button></td></tr>`;
       }).join("");
       const invalidHtml = invalids.length

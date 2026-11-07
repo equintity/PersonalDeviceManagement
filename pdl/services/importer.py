@@ -466,7 +466,10 @@ def preview_codes(project_root, codes) -> dict:
             "description": info["description"],
             "price": info["price"],
             "price_currency": info["currency"] or "USD",
-            "qty": min(info["stock"], security.MAX_QTY) if info["stock"] > 0 else 1,
+            # 库存 = 用户实际持有量,默认 1(保存前可改);
+            # 商城现货仅作参考展示,不作为用户库存写入
+            "qty": 1,
+            "mall_stock": info["stock"],
         })
         time.sleep(price_service.REQUEST_INTERVAL)
     return {"items": items, "invalid": invalid_rows}

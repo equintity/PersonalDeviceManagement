@@ -24,7 +24,8 @@ class TestPreview:
         assert it["name"] == "RES 56kohm 1210"
         assert it["model"] == "1210W3J0563T5E" and it["package"] == "1210"
         assert it["manufacturer"] == "UNI-ROYAL"
-        assert it["price"] == 0.0065 and it["qty"] == 5000
+        assert it["price"] == 0.0065
+        assert it["qty"] == 1 and it["mall_stock"] == 5000  # 默认 1,商城现货仅参考
 
     def test_invalid_and_dedupe(self, root, monkeypatch):
         monkeypatch.setattr(prices, "fetch_lcsc_detail", lambda code: _info())
