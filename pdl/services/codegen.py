@@ -18,12 +18,11 @@ import json
 import shutil
 from pathlib import Path
 
+from .. import APP_VERSION as APP_VERSION
 from .. import security
 from ..db import utc_now
 from ..paths import as_resources
 from . import boxmap
-
-APP_VERSION = "1.0.0"
 
 _HEADER_TEMPLATE = """\
 // ===========================================================================

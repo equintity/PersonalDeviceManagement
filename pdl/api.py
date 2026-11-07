@@ -15,6 +15,7 @@ from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request, send_file
 
+from . import APP_VERSION
 from . import security
 from .db import db_path
 from .paths import as_data
@@ -72,7 +73,7 @@ def system_info():
     db_file = db_path(_root())
     return _ok({
         "app": "PersonalDeviceManagement",
-        "version": codegen.APP_VERSION,
+        "version": APP_VERSION,
         "db_path": str(db_file),
         "db_size_kb": round(db_file.stat().st_size / 1024, 1) if db_file.exists() else 0,
         "limits": {
