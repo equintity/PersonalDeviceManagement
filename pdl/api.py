@@ -616,6 +616,32 @@ def serial_disconnect():
     return _ok(st)
 
 
+@bp.get("/serial/stock-diff")
+def serial_stock_diff():
+    """T5/QA-04:连接时检测到的库存差异(未确认前可反复查询)。"""
+    return _ok(_bridge().stock_diff_view())
+
+
+@bp.post("/serial/stock-diff/apply")
+def serial_stock_diff_apply():
+    body = _body()
+    resolution = body.get("resolution")
+    if resolution not in ("box", "host"):
+        raise security.ValidationError("resolution 必须是 box 或 host")
+    cells = body.get("cells")
+    if cells is not None:
+        if not isinstance(cells, list):
+            raise security.ValidationError("cells 必须是数组")
+        cells = [security.validate_int(c, field="格位编号", min_val=0,
+                                       max_val=security.MAX_CELLS) for c in cells]
+    try:
+        r = _bridge().apply_stock_diff(resolution, cells)
+    except BridgeError as exc:
+        return _fail(str(exc), 409)
+    _op("serial.stock-diff", f"resolution={resolution}", f"处理 {r['applied']} 格")
+    return _ok(r)
+
+
 @bp.get("/serial/status")
 def serial_status():
     return _ok(_bridge().status())

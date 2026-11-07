@@ -24,6 +24,20 @@ int32_t qty_of(uint16_t cell) {
     return cell < BOX_CELLS ? s_qty[cell] : -1;
 }
 
+// T5/QA-04:sync 基线(b<cell>)——host 下发的值;按键/qty 只改 q
+uint32_t base_of(uint16_t cell) {
+    uint32_t b = storage::load_base(cell, 0xFFFF);
+    if (b == 0xFFFF) {                       // 首次无基线:视为与 q 一致
+        b = storage::load_qty(cell, 0);
+        storage::save_base(cell, b);
+    }
+    return b;
+}
+
+void set_base(uint16_t cell, uint32_t qty) {
+    storage::save_base(cell, qty);
+}
+
 static int mapping_index(uint16_t cell) {
     for (int i = 0; i < MAPPING_COUNT; i++)
         if (BOX_MAPPINGS[i].cell == cell) return i;
@@ -117,6 +131,13 @@ void setup() {
         if (cell < BOX_CELLS) {
             app::s_qty[cell] = static_cast<int32_t>(
                 storage::load_qty(cell, BOX_MAPPINGS[i].qty));
+        }
+    }
+    // T5:首次使用(无 b<cell> 基线)时 b := q,避免首次连接全员误报差异
+    for (int i = 0; i < MAPPING_COUNT; i++) {
+        const uint16_t cell = BOX_MAPPINGS[i].cell;
+        if (cell < BOX_CELLS && !storage::has_base(cell)) {
+            storage::save_base(cell, static_cast<uint32_t>(app::s_qty[cell]));
         }
     }
 

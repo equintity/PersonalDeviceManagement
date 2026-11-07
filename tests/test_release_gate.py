@@ -208,11 +208,14 @@ class TestUndoIdempotency:
         assert len([m for m in moves if m["source"] == "undo"]) == 1
 
     def test_undo_pushes_qty_to_box(self, client):
-        """撤销带 cell 的流水(box_take)→ 盒子收到 qty 回写。"""
+        """撤销带 cell 的流水(box_take,经差异确认产生)→ 盒子收到 qty 回写。"""
         dev = device_create(client, "盒撤件")
         client.post("/api/box/mapping", json={"cell": 0, "device_id": dev["id"]})
         client.post("/api/serial/connect", json={"port": "virtual://box"})
         client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        client.post("/api/serial/stock-diff/apply", json={"resolution": "box"})
         moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
         take_move = next(m for m in moves if m["source"] == "box_take")
         since = client.get("/api/serial/events?since=0").get_json()["data"]["events"]
@@ -375,3 +378,105 @@ class TestQtyCeiling:
         info = client.get("/api/system/info").get_json()["data"]
         assert info["limits"]["max_qty"] == 65535
         assert info["schema_version"] == 4
+
+
+class TestStockDiff:
+    """T5/QA-04:离线取料在重连时以差异形式呈现,用户确认后才落账。"""
+
+    def _connect_with_mapping(self, client):
+        dev = device_create(client, "差异件")
+        client.post("/api/box/mapping", json={"cell": 0, "device_id": dev["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        return dev
+
+    def test_offline_take_surfaces_as_diff(self, client):
+        dev = self._connect_with_mapping(client)
+        for _ in range(3):                                          # 离线取料 3 次
+            client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        client.post("/api/serial/disconnect")                       # 盒子 q=7,b=10
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.get("/api/serial/stock-diff").get_json()["data"]
+        assert r["pending"] is True and len(r["items"]) == 1
+        it = r["items"][0]
+        assert it["box_qty"] == 7 and it["db_qty"] == 10 and it["delta"] == -3
+        client.post("/api/serial/disconnect")
+
+    def test_apply_box_writes_move_and_clears(self, client):
+        dev = self._connect_with_mapping(client)
+        client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.post("/api/serial/stock-diff/apply",
+                        json={"resolution": "box"}).get_json()["data"]
+        assert r["applied"] == 1 and r["remaining"] == 0
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 9                                  # DB 以盒子为准
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert moves[0]["source"] == "box_take" and moves[0]["delta"] == -1
+        # 重连:无差异(基线已刷新)
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.get("/api/serial/stock-diff").get_json()["data"]
+        assert r["pending"] is False
+        client.post("/api/serial/disconnect")
+
+    def test_apply_host_overwrites_box(self, client):
+        dev = self._connect_with_mapping(client)
+        client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        moves_before = client.get(
+            f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        r = client.post("/api/serial/stock-diff/apply",
+                        json={"resolution": "host"}).get_json()["data"]
+        assert r["applied"] == 1
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 10                                 # DB 不动
+        moves_after = client.get(
+            f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert len(moves_after) == len(moves_before)          # 不写流水
+        client.post("/api/serial/disconnect")
+
+    def test_no_diff_no_pending(self, client):
+        self._connect_with_mapping(client)
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.get("/api/serial/stock-diff").get_json()["data"]
+        assert r["pending"] is False                          # 不弹窗
+        client.post("/api/serial/disconnect")
+
+    def test_apply_idempotent(self, client):
+        dev = self._connect_with_mapping(client)
+        client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        client.post("/api/serial/stock-diff/apply", json={"resolution": "box"})
+        r2 = client.post("/api/serial/stock-diff/apply",
+                         json={"resolution": "box"}).get_json()["data"]
+        assert r2["applied"] == 0                             # 重复 apply 不重复扣减
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 9
+        client.post("/api/serial/disconnect")
+
+    def test_full_box_diff_aggregates(self, client):
+        """63 格满映射:stock 分帧聚合无丢帧。"""
+        from pdl.db import get_db
+        from pdl.api import _ctx
+        for i in range(63):
+            d = device_create(client, f"件{i:02d}")
+            row, col = divmod(i, 9)
+            get_db(_ctx["project_root"]).execute(
+                "INSERT OR REPLACE INTO mappings (row, col, device_id) VALUES (?,?,?)",
+                (row, col, d["id"]))
+        get_db(_ctx["project_root"]).commit()
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        # 盒内模拟 63 格各取 1(基线 10 → q 9)
+        for i in range(63):
+            client.post("/api/serial/simulate",
+                        json={"action": "take", "cell": i})
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.get("/api/serial/stock-diff").get_json()["data"]
+        assert r["pending"] is True and len(r["items"]) == 63
+        assert all(it["delta"] == -1 for it in r["items"])
+        client.post("/api/serial/disconnect")

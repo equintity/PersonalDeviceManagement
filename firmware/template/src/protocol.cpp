@@ -10,6 +10,8 @@ int32_t qty_of(uint16_t cell);            // 未映射返回 -1
 void set_qty(uint16_t cell, uint32_t qty, bool persist, bool notify_host);
 uint16_t first_mapped_cell();
 void remote_light(int16_t cell);          // -1 = 熄灭
+uint32_t base_of(uint16_t cell);          // T5:sync 基线
+void set_base(uint16_t cell, uint32_t qty);
 }  // namespace app
 
 void protocol::begin(Stream& serial) { s_serial = &serial; }
@@ -147,6 +149,8 @@ void handle_line(const char* line) {
                 if (cell < 0 || cell >= BOX_CELLS || qty < 0 || qty > 65535) continue;
                 app::set_qty(static_cast<uint16_t>(cell), static_cast<uint32_t>(qty),
                              true, false);
+                app::set_base(static_cast<uint16_t>(cell),
+                              static_cast<uint32_t>(qty));   // T5:基线=host 值
                 mapped++;
             }
         }
@@ -167,6 +171,43 @@ void handle_line(const char* line) {
         const int32_t q = app::qty_of(static_cast<uint16_t>(cell));
         if (q > 0) app::set_qty(static_cast<uint16_t>(cell),
                                 static_cast<uint32_t>(q - 1), true, true);
+        return;
+    }
+
+    if (strcmp(cmd, "stock") == 0) {
+        // T5/QA-04:返回 q != b 的已映射格,8 项/帧;无差异也回一帧空 items
+        static uint16_t diffs[BOX_CELLS];
+        uint16_t n = 0;
+        for (uint16_t cell = 0; cell < BOX_CELLS && n < BOX_CELLS; cell++) {
+            const int32_t q = app::qty_of(cell);
+            if (q < 0) continue;                        // 未映射格跳过
+            if (static_cast<uint32_t>(q) != app::base_of(cell))
+                diffs[n++] = cell;
+        }
+        const uint16_t total = (n + 7) / 8 > 0 ? (n + 7) / 8 : 1;
+        for (uint16_t seq = 1; seq <= total; seq++) {
+            JsonDocument doc;
+            doc["evt"] = "stock";
+            doc["seq"] = seq;
+            doc["total"] = total;
+            doc["complete"] = (seq == total);
+            JsonArray arr = doc["items"].to<JsonArray>();
+            const uint16_t start = (seq - 1) * 8;
+            for (uint8_t k = 0; k < 8; k++) {
+                const uint16_t idx = start + k;
+                if (idx >= n) break;
+                JsonObject o = arr.add<JsonObject>();
+                o["cell"] = diffs[idx];
+                o["qty"] = app::qty_of(diffs[idx]);
+                for (int i = 0; i < MAPPING_COUNT; i++) {
+                    if (BOX_MAPPINGS[i].cell == diffs[idx]) {
+                        o["code"] = BOX_MAPPINGS[i].code;
+                        break;
+                    }
+                }
+            }
+            send_json(doc);
+        }
         return;
     }
 

@@ -151,11 +151,16 @@ class TestD03StockMoves:
         assert moves and moves[0]["source"] == "import" and moves[0]["after_qty"] == 1
 
     def test_box_take_move_records_cell(self, client):
+        """T5 新语义:simulate=离线按键;box_take 流水经差异确认(以盒子为准)产生。"""
         dev = device_create(client, "盒取件")
         client.post("/api/box/mapping", json={"cell": 5, "device_id": dev["id"]})
         client.post("/api/serial/connect", json={"port": "virtual://box"})
         client.post("/api/serial/simulate", json={"action": "take", "cell": 5})
         client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.post("/api/serial/stock-diff/apply",
+                        json={"resolution": "box"}).get_json()["data"]
+        assert r["applied"] == 1
         moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
         assert moves[0]["source"] == "box_take" and moves[0]["cell"] == 5
 
