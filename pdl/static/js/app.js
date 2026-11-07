@@ -463,7 +463,16 @@
         if (!items.length) return;
         btn.disabled = true; btn.textContent = "保存中…";
         try {
-          const r = await api("/import/save-preview", { json: { items } });
+          let r = await api("/import/save-preview", { json: { items } });
+          if (r.duplicate) {   // T3:同一内容重复保存,确认后才累加
+            const prev = r.last || {};
+            const again = confirm(`本次内容已于 ${prev.created_at || "之前"} 保存过` +
+              `(新增 ${prev.stats?.created ?? "?"} / 合并 ${prev.stats?.merged ?? "?"})。` +
+              "确定要再次保存并累加数量吗?");
+            if (!again) { btn.disabled = false; btn.textContent = "✔ 确认保存"; return; }
+            r = await api("/import/save-preview",
+                          { json: { items, force: true } });
+          }
           toast(`已保存:新增 ${r.created} 件,合并 ${r.merged} 件` +
                 (r.failed.length ? `,失败 ${r.failed.length} 件` : ""),
                 r.failed.length ? "warn" : "ok");

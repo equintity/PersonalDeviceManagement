@@ -397,19 +397,30 @@ def import_files():
                                             and _is_full_field_csv(s["path"]))]
     csv_files = [s for s in saved if s not in order_files]
     total = {"imported": 0, "merged": 0, "skipped": 0, "errors": []}
+    duplicates: list[dict] = []
     if order_files:
         stats = importer.import_files(_root(), order_files, fetch_details=fetch,
                                       force=force)
         if stats.get("duplicate"):
-            return _ok(stats)   # T-M2-01:重复批次,交由前端二次确认
-        for k in ("imported", "merged", "skipped"):
-            total[k] += stats.get(k, 0)
-        total["errors"].extend(stats.get("errors", []))
+            duplicates.extend(stats.get("previous", []))   # T3:汇总后再确认
+        else:
+            for k in ("imported", "merged", "skipped"):
+                total[k] += stats.get(k, 0)
+            total["errors"].extend(stats.get("errors", []))
     if csv_files:
-        stats = importer.import_csv(_root(), csv_files)
-        for k in ("imported", "merged", "skipped"):
-            total[k] += stats.get(k, 0)
-        total["errors"].extend(stats.get("errors", []))
+        stats = importer.import_csv(_root(), csv_files, force=force)
+        if stats.get("duplicate"):
+            duplicates.extend(stats.get("previous", []))
+        else:
+            for k in ("imported", "merged", "skipped"):
+                total[k] += stats.get(k, 0)
+            total["errors"].extend(stats.get("errors", []))
+    if duplicates and not force:
+        # T3:任一分支判重 → 整批交由前端二次确认(未执行的分支不会写库)
+        return _ok({"duplicate": True, "previous": duplicates,
+                    "last": duplicates[0] if duplicates else None,
+                    "imported": 0, "merged": 0, "skipped": 0,
+                    "errors": total["errors"]})
     if total["imported"] + total["merged"] == 0 and not total["errors"]:
         raise security.ValidationError("所有文件都没有识别到有效数据")
     _op("import.files", ", ".join(s["filename"] for s in saved)[:100],
@@ -441,9 +452,14 @@ def import_preview():
 def import_save_preview():
     """C 编号一键加载·阶段二:保存用户确认/编辑后的预览行。"""
     body = _body()
-    r = importer.save_preview(_root(), body.get("items"))
-    _op("import.preview-save", "C 编号一键加载",
-        f"新增 {r['created']} / 合并 {r['merged']} / 失败 {len(r['failed'])}")
+    r = importer.save_preview(_root(), body.get("items"),
+                              force=security.validate_bool(
+                                  body.get("force", False), field="force"))
+    if r.get("duplicate"):
+        _op("import.preview-save", "C 编号一键加载", "重复保存,默认拦截")
+    else:
+        _op("import.preview-save", "C 编号一键加载",
+            f"新增 {r['created']} / 合并 {r['merged']} / 失败 {len(r['failed'])}")
     return _ok(r)
 
 

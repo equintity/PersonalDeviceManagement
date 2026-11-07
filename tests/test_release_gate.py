@@ -223,3 +223,71 @@ class TestUndoIdempotency:
                     and e["data"].get("cmd") == "qty"]
         assert qty_cmds and qty_cmds[-1]["data"]["qty"] == 10   # 9 回退到 10
         client.post("/api/serial/disconnect")
+
+
+class TestImportIdempotency:
+    """T3/QA-03:CSV 与预览保存接入导入幂等;口径=内容而非文件名。"""
+
+    import io as _io
+
+    def _csv_file(self, tmp_path, content, name):
+        f = tmp_path / name
+        f.write_text(content, encoding="utf-8-sig")
+        return f
+
+    CSV = "lcsc_code,name,qty,package\nC25704,测试电阻,10,0603\n"
+
+    def test_csv_duplicate_by_content(self, client, tmp_path):
+        f1 = self._csv_file(tmp_path, self.CSV, "a.csv")
+        f2 = self._csv_file(tmp_path, self.CSV, "b.csv")   # 不同文件名同内容
+        r1 = client.post("/api/import/files",
+                         data={"files": (self._io.BytesIO(f1.read_bytes()), "a.csv")}
+                         ).get_json()["data"]
+        assert r1["imported"] == 1
+        r2 = client.post("/api/import/files",
+                         data={"files": (self._io.BytesIO(f2.read_bytes()), "b.csv")}
+                         ).get_json()["data"]
+        assert r2.get("duplicate") is True                 # 按内容判重
+        assert r2["last"]["created_at"]
+        dev = client.get("/api/devices?q=C25704").get_json()["data"]["items"][0]
+        assert dev["qty"] == 10                            # 不翻倍
+
+    def test_csv_changed_content_not_duplicate(self, client, tmp_path):
+        client.post("/api/import/files",
+                    data={"files": (self._io.BytesIO(self.CSV.encode()), "a.csv")})
+        changed = self.CSV.replace("10", "15")
+        r = client.post("/api/import/files",
+                        data={"files": (self._io.BytesIO(changed.encode()), "a.csv")}
+                        ).get_json()["data"]
+        assert r.get("duplicate") is None
+        dev = client.get("/api/devices?q=C25704").get_json()["data"]["items"][0]
+        assert dev["qty"] == 25                            # 10 + 15 正常合并
+
+    def test_csv_force_accumulates(self, client, tmp_path):
+        f = self._csv_file(tmp_path, self.CSV, "a.csv")
+        client.post("/api/import/files",
+                    data={"files": (self._io.BytesIO(f.read_bytes()), "a.csv")})
+        r = client.post("/api/import/files",
+                        data={"files": (self._io.BytesIO(f.read_bytes()), "a.csv"),
+                              "force": "1"}).get_json()["data"]
+        assert r.get("duplicate") is None and r["merged"] == 1
+        dev = client.get("/api/devices?q=C25704").get_json()["data"]["items"][0]
+        assert dev["qty"] == 20
+
+    def test_preview_double_save_duplicate(self, client):
+        d = device_create(client, "预览幂等件", lcsc_code="C25704")
+        item = {"code": "C25704", "status": "exists", "cycle": "normal",
+                "name": d["name"], "model": "", "package": "", "manufacturer": "",
+                "category": "", "description": "", "price": None,
+                "price_currency": "USD", "qty": 5}
+        r1 = client.post("/api/import/save-preview", json={"items": [item]})
+        assert r1.get_json()["data"]["merged"] == 1
+        r2 = client.post("/api/import/save-preview", json={"items": [item]})
+        assert r2.get_json()["data"].get("duplicate") is True   # 双击/重试不翻倍
+        d = client.get(f"/api/devices/{d['id']}").get_json()["data"]
+        assert d["qty"] == 15                                   # 只累加一次
+        r3 = client.post("/api/import/save-preview",
+                         json={"items": [item], "force": True})
+        assert r3.get_json()["data"]["merged"] == 1             # force 才再累加
+        d = client.get(f"/api/devices/{d['id']}").get_json()["data"]
+        assert d["qty"] == 20
