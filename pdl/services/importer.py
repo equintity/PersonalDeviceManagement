@@ -309,8 +309,29 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
         d = details.get(code, {})
         name = security.sanitize_text(d.get("name") or code, field="器件名",
                                       max_len=security.MAX_NAME_LEN) or code
-        row = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?", (code,)).fetchone()
-        if row:  # 已存在:数量累加,补充缺失的详情(T-M1-01:同事务写流水)
+        row = conn.execute(
+            "SELECT id, qty, deleted_at FROM devices WHERE lcsc_code = ?",
+            (code,)).fetchone()
+        if row and row["deleted_at"] is not None:
+            # 曾被软删除:复活该行,库存以本次导入为准(而非累加进隐藏行)
+            before = row["qty"]
+            after = min(security.MAX_QTY, max(qty, 0))
+            conn.execute(
+                "UPDATE devices SET deleted_at = NULL, qty = ?,"
+                " name = ?, category = ?, package = ?, manufacturer = ?,"
+                " description = ?, price = COALESCE(?, price), source = 'lcsc',"
+                " updated_at = ? WHERE id = ?",
+                (after, name,
+                 security.sanitize_text(d.get("category", "")),
+                 security.sanitize_text(d.get("package", "")),
+                 security.sanitize_text(d.get("manufacturer", "")),
+                 security.sanitize_text(d.get("description", "")),
+                 d.get("price"), now, row["id"]))
+            device_service._write_move(conn, row["id"], after - before, before, after,
+                                       source="import", ref=detail[:80],
+                                       note="删除后重新导入,器件恢复")
+            imported += 1
+        elif row:  # 在库:数量累加,补充缺失的详情(T-M1-01:同事务写流水)
             before = row["qty"]
             after = min(security.MAX_QTY, before + qty)
             conn.execute(
@@ -417,8 +438,9 @@ def import_csv(project_root, file_items: list[dict]) -> dict:
     imported = merged = 0
     now = utc_now()
     for code, name, qty, data in all_entries:
-        existing = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?",
-                                (code,)).fetchone() if code else None
+        existing = conn.execute(
+            "SELECT id, qty FROM devices WHERE lcsc_code = ? AND deleted_at IS NULL",
+            (code,)).fetchone() if code else None
         if existing:
             before = existing["qty"]
             after = min(security.MAX_QTY, before + qty)
@@ -500,7 +522,8 @@ def preview_codes(project_root, codes) -> dict:
                           "reason": "接口无返回:编号可能不存在,或网络/限流异常"})
             continue
         row = conn.execute(
-            "SELECT qty FROM devices WHERE lcsc_code = ?", (code,)).fetchone()
+            "SELECT qty FROM devices WHERE lcsc_code = ? AND deleted_at IS NULL",
+            (code,)).fetchone()
         items.append({
             "code": code,
             "status": "exists" if row else "new",
@@ -576,9 +599,30 @@ def save_preview(project_root, items) -> dict:
             continue
 
         cycle = security.sanitize_text(raw.get("cycle") or "normal", max_len=20)
-        row = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?",
-                           (code,)).fetchone()
-        if row:  # 已存在:合并数量 + 刷新价格状态(人工字段不覆盖,写流水)
+        row = conn.execute(
+            "SELECT id, qty, deleted_at FROM devices WHERE lcsc_code = ?",
+            (code,)).fetchone()
+        if row and row["deleted_at"] is not None:
+            # 曾被软删除:按预览值复活(用户在预览里编辑过的字段生效)
+            before = row["qty"]
+            after = min(security.MAX_QTY, max(qty, 0))
+            status_value = ("discontinued" if cycle != "normal"
+                            else ("ok" if price is not None else "no_match"))
+            conn.execute(
+                "UPDATE devices SET deleted_at = NULL, qty = ?, name = ?, model = ?,"
+                " category = ?, package = ?, manufacturer = ?, description = ?,"
+                " price = ?, price_currency = ?, price_status = ?, price_source = 'lcsc',"
+                " price_updated_at = ?, updated_at = ? WHERE id = ?",
+                (after, fields["name"], fields["model"], fields["category"],
+                 fields["package"], fields["manufacturer"], fields["description"],
+                 price,
+                 security.sanitize_text(raw.get("price_currency") or "USD", max_len=6),
+                 status_value, now, now, row["id"]))
+            device_service._write_move(conn, row["id"], after - before, before, after,
+                                       source="import", ref="一键加载",
+                                       note="删除后重新加载,器件恢复")
+            created += 1
+        elif row:  # 在库:合并数量 + 刷新价格状态(人工字段不覆盖,写流水)
             before = row["qty"]
             after = min(security.MAX_QTY, before + qty)
             status_value = ("discontinued" if cycle != "normal"

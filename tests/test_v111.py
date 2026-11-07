@@ -71,8 +71,8 @@ class TestD01ProtocolScale:
             assert len(line.encode("utf-8")) <= 1024, seq
 
 
-def device_create(client, name):
-    resp = client.post("/api/devices", json={"name": name, "qty": 10})
+def device_create(client, name, **kw):
+    resp = client.post("/api/devices", json={"name": name, "qty": 10, **kw})
     assert resp.status_code == 201
     return resp.get_json()["data"]
 
@@ -265,3 +265,54 @@ class TestRegressionGuards:
         dev = device_create(client, "手工件")
         moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
         assert moves == []          # 手工新建 qty 随器件创建,不算一次变动
+
+
+class TestReviveAfterDelete:
+    """回归修复:软删除后重新导入/新建,应复活器件而非命中隐藏行。"""
+
+    def test_import_after_delete_revives(self, root):
+        d = device_service.create_device(root, {"name": "旧电阻", "lcsc_code": "C25704",
+                                                "qty": 10})
+        device_service.delete_devices(root, [d["id"]])
+        importer.import_codes(root, ["C25704"], fetch_details=False)
+        items = device_service.list_devices(root, q="C25704")["items"]
+        assert len(items) == 1                       # 重新可见
+        assert items[0]["id"] == d["id"]             # 同一行复活
+        assert items[0]["qty"] == 1                  # 以导入数量为准,不继承旧库存
+
+    def test_preview_after_delete_is_new(self, client, monkeypatch):
+        from pdl.services import prices as prices_mod
+        dev = device_create(client, "旧件")
+        client.post("/api/devices/batch-delete", json={"ids": [dev["id"]]})
+        monkeypatch.setattr(prices_mod, "fetch_lcsc_detail", lambda code: {
+            "price": 0.5, "currency": "USD", "model": "M1", "stock": 100,
+            "cycle": "normal", "brand": "B", "package": "0603",
+            "name": "B M1", "category": "C", "description": "D"})
+        resp = client.post("/api/import/preview", json={"codes": ["C25704"]})
+        assert resp.get_json()["data"]["items"][0]["status"] == "new"  # 不再"已存在"
+
+    def test_save_preview_after_delete_revives(self, client, monkeypatch):
+        from pdl.services import prices as prices_mod
+        dev = device_create(client, "旧电容", lcsc_code="C25704")
+        client.post("/api/devices/batch-delete", json={"ids": [dev["id"]]})
+        monkeypatch.setattr(prices_mod, "fetch_lcsc_detail", lambda code: {
+            "price": 0.5, "currency": "USD", "model": "M1", "stock": 100,
+            "cycle": "normal", "brand": "B", "package": "0603",
+            "name": "B M1", "category": "C", "description": "D"})
+        item = {"code": "C25704", "status": "new", "cycle": "normal",
+                "name": "重新导入的电容", "model": "M1", "package": "0603",
+                "manufacturer": "B", "category": "C", "description": "D",
+                "price": 0.5, "price_currency": "USD", "qty": 7}
+        resp = client.post("/api/import/save-preview", json={"items": [item]})
+        assert resp.get_json()["data"]["created"] == 1
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 7 and d["name"] == "重新导入的电容"   # 编辑值生效
+
+    def test_create_same_code_after_delete_revives(self, client):
+        d1 = device_create(client, "第一版", lcsc_code="C25704")
+        client.post("/api/devices/batch-delete", json={"ids": [d1["id"]]})
+        resp = client.post("/api/devices",
+                           json={"name": "第二版", "qty": 5, "lcsc_code": "C25704"})
+        assert resp.status_code == 201                # 复活而非报"已存在"
+        d2 = resp.get_json()["data"]
+        assert d2["id"] == d1["id"] and d2["name"] == "第二版" and d2["qty"] == 5

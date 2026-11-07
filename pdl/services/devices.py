@@ -120,8 +120,27 @@ def create_device(project_root, data: dict) -> dict:
              json.dumps(attrs, ensure_ascii=False), "manual", now, now),
         )
         conn.commit()
-    except sqlite3.IntegrityError as exc:
-        raise security.ValidationError(f"创建失败:C编号已存在({exc})") from None
+    except sqlite3.IntegrityError:
+        # 软删除行占用该编号:按新数据复活,而不是报错
+        if code:
+            dead = conn.execute(
+                "SELECT id FROM devices WHERE lcsc_code = ? AND deleted_at IS NOT NULL",
+                (code,)).fetchone()
+            if dead:
+                conn.execute(
+                    "UPDATE devices SET deleted_at = NULL, name = ?, qty = ?,"
+                    " category = ?, package = ?, manufacturer = ?, description = ?,"
+                    " notes = ?, attrs = ?, source = 'manual', updated_at = ?"
+                    " WHERE id = ?",
+                    (name, qty, fields["category"], fields["package"],
+                     fields["manufacturer"], fields["description"], fields["notes"],
+                     json.dumps(attrs, ensure_ascii=False), now, dead["id"]))
+                _write_move(conn, dead["id"], qty, 0, qty, source="manual",
+                            note="删除后按同编号重新创建,器件恢复")
+                conn.commit()
+                return get_device(project_root, dead["id"])
+        raise security.ValidationError(
+            f"创建失败:C编号已存在({code or '重复'})") from None
     return get_device(project_root, cur.lastrowid)
 
 
