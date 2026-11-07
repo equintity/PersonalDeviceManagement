@@ -12,7 +12,7 @@ from .paths import AppPaths, as_resources
 from .services import boxmap, devices
 from .services.serial_bridge import SerialBridge
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 
 # 安全响应头:本地应用也按“最小权限”原则收紧
 _SECURITY_HEADERS = {
