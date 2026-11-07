@@ -93,6 +93,7 @@ def system_info():
         "limits": {
             "max_rows": security.MAX_ROWS, "max_cols": security.MAX_COLS,
             "max_cells": security.MAX_CELLS, "max_name_len": security.MAX_NAME_LEN,
+            "max_qty": security.MAX_QTY,
         },
     })
 

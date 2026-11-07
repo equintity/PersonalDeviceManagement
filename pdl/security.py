@@ -53,7 +53,8 @@ MAX_ROWS = 16
 MAX_COLS = 24
 MAX_CELLS = 256  # rows*cols 硬上限
 MAX_DEVICES = 100_000
-MAX_QTY = 9_999_999
+MAX_QTY = 65535                     # T4/QA-05:与固件 uint16 NVS 对齐;改动需同步 firmware 与协议文档
+MAX_QTY_REASON = "固件单格上限 65535"
 MAX_NAME_LEN = 64
 MAX_TEXT_LEN = 500
 
@@ -184,6 +185,15 @@ def validate_int(
         raise ValidationError(f"{field} 必须是整数")
     if value < min_val or value > max_val:
         raise ValidationError(f"{field} 必须在 {min_val} ~ {max_val} 之间")
+    return value
+
+
+def validate_qty(value, field: str = "库存数量") -> int:
+    """库存数量:0~65535(T4/QA-05,与固件 uint16 NVS 口径一致)。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field} 必须是整数")
+    if value < 0 or value > MAX_QTY:
+        raise ValidationError(f"{field} 超出范围 0~{MAX_QTY}({MAX_QTY_REASON})")
     return value
 
 

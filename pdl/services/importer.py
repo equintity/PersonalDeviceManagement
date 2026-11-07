@@ -315,21 +315,23 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
         if qty <= 0:
             skipped += 1
             continue
-        try:
-            qty = security.validate_int(qty, field="数量", min_val=1, max_val=security.MAX_QTY)
-        except security.ValidationError:
-            skipped += 1
-            continue
         d = details.get(code, {})
         name = security.sanitize_text(d.get("name") or code, field="器件名",
                                       max_len=security.MAX_NAME_LEN) or code
+        # T4/QA-05:超限拒绝并报错(不静默夹值),错误含器件名与原始值
+        try:
+            qty = security.validate_qty(qty, field="数量")
+        except security.ValidationError as exc:
+            conn.rollback()
+            raise security.ValidationError(
+                f"器件「{name}」({code}) 导入数量 {qty}:{exc};导入已取消") from None
         row = conn.execute(
             "SELECT id, qty, deleted_at FROM devices WHERE lcsc_code = ?",
             (code,)).fetchone()
         if row and row["deleted_at"] is not None:
             # 曾被软删除:复活该行,库存以本次导入为准(而非累加进隐藏行)
             before = row["qty"]
-            after = min(security.MAX_QTY, max(qty, 0))
+            after = max(qty, 0)
             conn.execute(
                 "UPDATE devices SET deleted_at = NULL, qty = ?,"
                 " name = ?, category = ?, package = ?, manufacturer = ?,"
@@ -347,7 +349,12 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
             imported += 1
         elif row:  # 在库:数量累加,补充缺失的详情(T-M1-01:同事务写流水)
             before = row["qty"]
-            after = min(security.MAX_QTY, before + qty)
+            after = before + qty
+            if after > security.MAX_QTY:
+                conn.rollback()
+                raise security.ValidationError(
+                    f"器件「{name}」({code}) 导入后库存将为 {after},"
+                    f"超出上限 {security.MAX_QTY}({security.MAX_QTY_REASON});导入已取消")
             conn.execute(
                 "UPDATE devices SET qty = ?,"
                 " category = CASE WHEN category = '' THEN ? ELSE category END,"
@@ -429,21 +436,33 @@ def import_csv(project_root, file_items: list[dict], *, force: bool = False) -> 
             raise security.ValidationError(
                 f"{item['filename']}: 不是本工具导出的全字段 CSV(缺少 lcsc_code/name 列)")
         idx = {col: header.index(col) for col in _CSV_COLUMNS if col in header}
-        for row in rows[1:]:
+        for rowno, row in enumerate(rows[1:], start=2):
             get = lambda col: row[idx[col]] if col in idx and idx[col] < len(row) else ""
             code = security.validate_lcsc_code(get("lcsc_code"))
             name = security.validate_device_name(get("name") or code)
-            try:
-                qty = int(re.search(r"\d{1,7}", str(get("qty"))).group(0)) \
-                    if re.search(r"\d{1,7}", str(get("qty"))) else 1
-            except ValueError:
-                qty = 1
+            # T4/QA-05:数量解析健壮化 —— "1,000"→1000,小数四舍五入并把原文
+            # 记入 notes;解析失败/负数 → 400(文件名+行号+原文),删除 qty=1 静默兜底
+            raw_qty = str(get("qty")).strip()
+            cleaned = raw_qty.replace(",", "").replace("_", "").replace(" ", "")
+            note_extra = ""
+            if re.fullmatch(r"[0-9]+", cleaned):
+                qty = int(cleaned)
+                if cleaned != raw_qty:
+                    note_extra = f"数量原文:{raw_qty}"
+            elif re.fullmatch(r"[0-9]+\.[0-9]+", cleaned):
+                qty = round(float(cleaned))
+                note_extra = f"数量原文:{raw_qty}(四舍五入取整)"
+            else:
+                raise security.ValidationError(
+                    f"{item['filename']} 第 {rowno} 行数量无法识别:{raw_qty or '(空)'}")
             data = {
                 "lcsc_code": code, "name": name,
-                "qty": security.validate_int(qty, field="数量", min_val=0, max_val=security.MAX_QTY),
+                "qty": security.validate_qty(qty, field="数量"),
                 **{f: security.sanitize_text(get(f), max_len=security.MAX_TEXT_LEN)
                    for f in _LCSC_FIELDS + ("notes",)},
             }
+            if note_extra:
+                data["notes"] = (data["notes"] + "; " if data["notes"] else "") + note_extra
             all_entries.append((code, name, qty, data))
     if not all_entries:
         raise security.ValidationError("CSV 中没有有效数据行")
@@ -614,10 +633,10 @@ def save_preview(project_root, items, *, force: bool = False) -> dict:
             failed.append({"code": str(raw.get("code"))[:20], "error": "编号缺失或无效"})
             continue
         try:
-            qty = security.validate_int(
-                int(re.search(r"\d{1,7}", str(raw.get("qty") or "1")).group(0))
-                if re.search(r"\d{1,7}", str(raw.get("qty") or "1")) else 1,
-                field="库存数量", min_val=0, max_val=security.MAX_QTY)
+            qty = security.validate_qty(
+                int(re.search(r"[0-9]+", str(raw.get("qty") or "1")).group(0))
+                if re.search(r"[0-9]+", str(raw.get("qty") or "1")) else 1,
+                field="库存数量")
             fields = {
                 "name": security.sanitize_text(raw.get("name") or code,
                                                field="器件名",

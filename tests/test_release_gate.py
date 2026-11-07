@@ -291,3 +291,87 @@ class TestImportIdempotency:
         assert r3.get_json()["data"]["merged"] == 1             # force 才再累加
         d = client.get(f"/api/devices/{d['id']}").get_json()["data"]
         assert d["qty"] == 20
+
+
+class TestQtyCeiling:
+    """T4/QA-05:库存上限 65535 在 界面/DB/固件 三处口径一致。"""
+
+    def test_create_over_ceiling_rejected(self, client):
+        resp = client.post("/api/devices", json={"name": "超限件", "qty": 65536})
+        assert resp.status_code == 400
+        assert "65535" in resp.get_json()["error"]
+
+    def test_ceiling_value_saves_and_generates(self, client):
+        dev = client.post("/api/devices",
+                          json={"name": "满额件", "qty": 65535,
+                                "lcsc_code": "C99999"}).get_json()["data"]
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 65535
+        header = client.get("/api/codegen/preview").get_json()["data"]["content"]
+        assert "#define BOX_MAX_QTY         65535" in header
+        client.post("/api/box/mapping", json={"cell": 0, "device_id": dev["id"]})
+        header = client.get("/api/codegen/preview").get_json()["data"]["content"]
+        assert "65535" in header                      # 映射表里的 qty 也是 65535
+
+    def test_dirty_qty_refuses_generation(self, client, root):
+        dev = device_create(client, "脏数据件")
+        from pdl.db import get_db
+        from pdl.api import _ctx
+        conn = get_db(_ctx["project_root"])
+        conn.execute("UPDATE devices SET qty = 70000 WHERE id = ?", (dev["id"],))
+        conn.commit()
+        client.post("/api/box/mapping", json={"cell": 1, "device_id": dev["id"]})
+        resp = client.post("/api/codegen/generate",
+                           json={"output_dir": str(root.parent / "qty-dirty")})
+        assert resp.status_code == 400
+        assert "脏数据件" in resp.get_json()["error"]
+        assert "70000" in resp.get_json()["error"]
+
+    def test_import_over_ceiling_rejected(self, client, tmp_path):
+        from openpyxl import Workbook
+        f = tmp_path / "over.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["商品编号", "数量"])
+        ws.append(["C25704", 70000])
+        wb.save(f)
+        resp = client.post("/api/import/files",
+                           data={"files": (open(f, "rb"), "over.xlsx"),
+                                 "fetch_details": "0"})
+        assert resp.status_code == 400
+        body = resp.get_json()["error"]
+        assert "70000" in body and "C25704" in body
+        # 反例断言:不得出现"导入成功但库存被截断为 65535"的静默路径
+        items = client.get("/api/devices?q=C25704").get_json()["data"]["items"]
+        assert all(d["qty"] != 65535 for d in items)
+
+    def test_csv_qty_parsing(self, client, tmp_path):
+        # 1,000 → 1000
+        good = "lcsc_code,name,qty,package\nC25704,测试,1,000 0603\n".replace(
+            ",1,000 0603", ",\"1,000\",0603")
+        f = tmp_path / "qty.csv"
+        f.write_text("lcsc_code,name,qty,package\nC25704,测试,\"1,000\",0603\n",
+                     encoding="utf-8-sig")
+        r = client.post("/api/import/files",
+                        data={"files": (open(f, "rb"), "qty.csv"),
+                              "fetch_details": "0"})
+        assert r.status_code == 200
+        dev = client.get("/api/devices?q=C25704").get_json()["data"]["items"][0]
+        assert dev["qty"] == 1000
+        assert "数量原文" in (dev["notes"] or "")
+
+    def test_csv_bad_qty_rejected_with_location(self, client, tmp_path):
+        f = tmp_path / "bad.csv"
+        f.write_text("lcsc_code,name,qty,package\nC25704,测试,abc,0603\n",
+                     encoding="utf-8-sig")
+        r = client.post("/api/import/files",
+                        data={"files": (open(f, "rb"), "bad.csv"),
+                              "fetch_details": "0"})
+        assert r.status_code == 400
+        err = r.get_json()["error"]
+        assert "bad.csv" in err and "第 2 行" in err and "abc" in err
+
+    def test_system_info_reports_max_qty(self, client):
+        info = client.get("/api/system/info").get_json()["data"]
+        assert info["limits"]["max_qty"] == 65535
+        assert info["schema_version"] == 4

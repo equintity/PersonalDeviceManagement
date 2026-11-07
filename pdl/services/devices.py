@@ -105,7 +105,7 @@ def create_device(project_root, data: dict) -> dict:
     name = security.validate_device_name(data.get("name"))
     code = security.validate_lcsc_code(data.get("lcsc_code"))
     model = security.validate_model(data.get("model"))
-    qty = security.validate_int(data.get("qty", 0), field="库存数量", min_val=0, max_val=security.MAX_QTY)
+    qty = security.validate_qty(data.get("qty", 0))
     attrs = _validate_attrs(data.get("attrs"))
     price = _validate_price(data.get("price"))
     fields = {f: security.validate_str(data.get(f), field=f, max_len=security.MAX_TEXT_LEN)
@@ -168,8 +168,7 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
         old_qty = conn.execute("SELECT qty FROM devices WHERE id = ?",
                                (device_id,)).fetchone()["qty"]
         updates.append("qty = ?")
-        params.append(security.validate_int(data.get("qty", 0), field="库存数量",
-                                            min_val=0, max_val=security.MAX_QTY))
+        params.append(security.validate_qty(data.get("qty", 0)))
     if "price" in data:
         updates.append("price = ?")
         params.append(_validate_price(data.get("price")))

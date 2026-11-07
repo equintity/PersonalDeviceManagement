@@ -232,7 +232,8 @@
       <h3>${dev ? "编辑器件" : "新建器件"}</h3>
       <div class="row2">
         <label>C编号(可选)<input id="mCode" value="${esc(dev?.lcsc_code || "")}" placeholder="C25704"></label>
-        <label>库存数量<input id="mQty" type="number" min="0" value="${dev?.qty ?? 1}"></label>
+        <label>库存数量(上限 ${state.limits?.max_qty ?? 65535})
+          <input id="mQty" type="number" min="0" max="${state.limits?.max_qty ?? 65535}" value="${dev?.qty ?? 1}"></label>
       </div>
       <label>器件名称 *<input id="mName" value="${esc(dev?.name || "")}" maxlength="64"
         placeholder="如 100nF 50V X7R 0603 或 STM32F103C8T6"></label>
@@ -888,6 +889,7 @@
     try {
       const info = await api("/system/info");
       $("appVer").textContent = `v${info.version}`;
+      state.limits = info.limits;
     } catch { /* 忽略 */ }
     setupDesktopShell();
     await loadDevices();
