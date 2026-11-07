@@ -66,10 +66,11 @@ def create_app(project_root: str | Path | None = None, *,
 
     init_db(paths)
     try:
-        from .db import daily_backup
+        from .db import daily_backup, prune_backups
         daily_backup(paths)         # T-M1-04:启动自动日备份,保留 7 份
-    except Exception:               # 备份失败不阻断启动
-        pass
+        prune_backups(paths, "pre-restore-*.db", keep=3)   # T1:保险备份只留 3 份
+    except Exception as exc:        # 备份失败不阻断启动,但必须留痕
+        log_op(paths, "fail", "startup.backup", str(exc), ok=False)
 
     from .api import _ctx, bp  # 延迟导入避免循环
     import threading

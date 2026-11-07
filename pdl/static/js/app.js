@@ -218,7 +218,8 @@
     fd.append("file", f);
     try {
       const r = await api("/backup/import", { method: "POST", form: fd });
-      toast(`恢复完成:在库器件 ${r.devices} 件(恢复前数据已自动备份)`, "ok");
+      const mig = r.migrated ? `,schema 已从 ${r.from_schema} 迁移到 ${r.to_schema}` : "";
+      toast(`恢复完成:在库器件 ${r.devices} 件${mig}(恢复前数据已自动备份)`, "ok");
       setTimeout(() => location.reload(), 1600);   // 完成提示驻留 ≥1.5s 再刷新
     } catch (err) { toast(`恢复失败:${err.message}`, "err"); }
     $("restoreFile").value = "";
