@@ -86,7 +86,9 @@ class VirtualBox:
                     self._sync_buf = {}
                 for i in cmd.get("items", []):
                     if isinstance(i, dict) and "cell" in i:
-                        self._sync_buf[int(i["cell"])] = {"qty": int(i.get("qty", 0))}
+                        self._sync_buf[int(i["cell"])] = {
+                            "qty": int(i.get("qty", 0)),
+                            "name": str(i.get("name", ""))[:60]}
                 if seq >= total:
                     self._items = dict(self._sync_buf)
                     self._sync_buf = {}
@@ -442,6 +444,13 @@ class SerialBridge:
             remaining = len(self._pending_diff or [])
         return {"applied": applied, "resolution": resolution, "remaining": remaining}
 
+    @staticmethod
+    def _utf8_cut(s: str, limit: int) -> str:
+        """T8:UTF-8 安全截断(按字节,不切断多字节字符,去控制字符)。"""
+        from ..security import sanitize_text
+        clean = sanitize_text(s or "", max_len=200)
+        return clean.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
     def push_sync(self) -> bool:
         """把当前全部映射+库存推送到硬件(联动核心)。
 
@@ -450,7 +459,8 @@ class SerialBridge:
         """
         box = boxmap.get_box(self.project_root)
         items = [{"cell": m["cell"], "qty": m["device"]["qty"],
-                  "code": m["device"]["lcsc_code"] or ""}
+                  "code": m["device"]["lcsc_code"] or "",
+                  "name": self._utf8_cut(m["device"]["name"], 20)}
                  for m in box["mappings"] if m["device"]]
         rows, cols = box["config"]["rows"], box["config"]["cols"]
         if not items:

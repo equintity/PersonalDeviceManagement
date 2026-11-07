@@ -59,8 +59,9 @@ class TestD01ProtocolScale:
         client.post("/api/serial/disconnect")
 
     def test_sync_chunks_respect_line_limit(self, root):
-        """每帧 sync 都不超过 1024 字节协议上限。"""
-        bridge_items = [{"cell": i, "qty": 999999, "code": "C12345678"}
+        """每帧 sync(含 T8 name 字段)都不超过 1024 字节协议上限。"""
+        bridge_items = [{"cell": i, "qty": 999999, "code": "C12345678",
+                         "name": "二十字节名称测试ABCDEF"}      # T8:20 字节名称
                         for i in range(63)]
         chunks = [bridge_items[i:i + 8] for i in range(0, 63, 8)]
         assert len(chunks) == 8

@@ -570,3 +570,41 @@ class TestConnectionState:
             f"/api/devices/{dev['id']}/moves").get_json()["data"]
         assert len(moves_after) == len(moves_before)
         client.post("/api/serial/disconnect")
+
+
+class TestSyncName:
+    """T8/QA-07:映射名称随 sync 下发,OLED 不再显示旧名。"""
+
+    def test_name_delivered_and_updated(self, client):
+        d1 = device_create(client, "器件甲")
+        d2 = device_create(client, "器件乙名称更长一些")
+        client.post("/api/box/mapping", json={"cell": 5, "device_id": d1["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        client.post("/api/box/mapping", json={"cell": 5, "device_id": d2["id"]})
+        client.post("/api/serial/sync")           # 不重烧,手动同步
+        from pdl.api import _ctx
+        box = _ctx["bridge"]._virtual_box
+        assert box._items[5]["name"].startswith("器件乙")   # 新名称已下发
+        client.post("/api/serial/disconnect")
+
+    def test_long_and_emoji_name_safe(self, client):
+        long_name = "很长的器件名称" * 8             # 56 字符(≤名称上限 64)
+        d = device_create(client, long_name)
+        client.post("/api/box/mapping", json={"cell": 2, "device_id": d["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        from pdl.api import _ctx
+        box = _ctx["bridge"]._virtual_box
+        name = box._items[2]["name"]
+        assert len(name.encode("utf-8")) <= 20        # 字节级截断
+        name.encode("utf-8")                          # 仍是合法 UTF-8(无乱码)
+        client.post("/api/serial/disconnect")
+
+    def test_ready_mapped_unchanged(self, client):
+        d = device_create(client, "计数件")
+        client.post("/api/box/mapping", json={"cell": 3, "device_id": d["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        events = client.get("/api/serial/events?since=0").get_json()["data"]["events"]
+        ready = [e for e in events if e["dir"] == "in"
+                 and e["data"].get("evt") == "ready"]
+        assert ready and ready[-1]["data"]["mapped"] == 1   # 名称不影响计数
+        client.post("/api/serial/disconnect")

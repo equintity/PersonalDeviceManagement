@@ -12,6 +12,7 @@ uint16_t first_mapped_cell();
 void remote_light(int16_t cell);          // -1 = 熄灭
 uint32_t base_of(uint16_t cell);          // T5:sync 基线
 void set_base(uint16_t cell, uint32_t qty);
+void set_name(uint16_t cell, const char* name);   // T8:名称随 sync 下发
 }  // namespace app
 
 void protocol::begin(Stream& serial) { s_serial = &serial; }
@@ -151,6 +152,8 @@ void handle_line(const char* line) {
                              true, false);
                 app::set_base(static_cast<uint16_t>(cell),
                               static_cast<uint32_t>(qty));   // T5:基线=host 值
+                app::set_name(static_cast<uint16_t>(cell),
+                              item["name"] | "");            // T8:名称下发
                 mapped++;
             }
         }

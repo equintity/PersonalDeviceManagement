@@ -19,6 +19,18 @@ namespace app {
 
 static int32_t s_qty[BOX_CELLS];      // 每格库存,-1 = 未映射
 static uint16_t s_cursor = 0;
+// T8:格位名称缓存(RAM = BOX_CELLS*21 ≈ 1323B);每次 sync 下发,掉电丢失,
+// 为空时回退编译期 BOX_MAPPINGS[].name(不写 NVS —— 名称是易变展示数据)
+static char s_name[BOX_CELLS][21];
+
+// UTF-8 安全拷贝:≤20 字节且不切断多字节字符
+static void name_copy(char* dst, const char* src, size_t cap) {
+    size_t n = strlen(src);
+    if (n > cap - 1) n = cap - 1;
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 int32_t qty_of(uint16_t cell) {
     return cell < BOX_CELLS ? s_qty[cell] : -1;
@@ -60,6 +72,18 @@ void remote_light(int16_t cell) {
     led_matrix::set_lit(cell);
 }
 
+// T8:sync 下发的名称;空串不覆盖已有值
+void set_name(uint16_t cell, const char* name) {
+    if (cell >= BOX_CELLS || name == nullptr || name[0] == '\0') return;
+    name_copy(s_name[cell], name, 21);
+}
+
+const char* name_of(uint16_t cell) {
+    if (cell < BOX_CELLS && s_name[cell][0] != '\0') return s_name[cell];
+    const int idx = mapping_index(cell);
+    return idx >= 0 ? BOX_MAPPINGS[idx].name : "";
+}
+
 static void render_current() {
     const uint16_t cell = s_cursor;
     const int idx = mapping_index(cell);
@@ -67,7 +91,7 @@ static void render_current() {
         box_ui::show_cell(cell, "", "", 0, false);
         return;
     }
-    box_ui::show_cell(cell, BOX_MAPPINGS[idx].code, BOX_MAPPINGS[idx].name,
+    box_ui::show_cell(cell, BOX_MAPPINGS[idx].code, name_of(cell),
                       s_qty[cell], true);
 }
 
