@@ -30,15 +30,21 @@ class TestOrderXlsx:
         assert d["C25704"] == 4      # 3 + 1 同文件累加
         assert d["C81588"] == 2
 
-    def test_full_import_merge(self, root, tmp_path):
+    def test_full_import_idempotent(self, root, tmp_path):
+        """T-M2-01:同一订单重复导入默认拦截,显式确认后才合并累加。"""
         f = tmp_path / "order.xlsx"
         _make_order_xlsx(f)
         s1 = importer.import_files(root, [{"path": str(f), "filename": "order.xlsx"}])
         assert s1["imported"] == 2
         s2 = importer.import_files(root, [{"path": str(f), "filename": "order.xlsx"}])
-        assert s2["merged"] == 2     # 第二次导入全部合并
+        assert s2.get("duplicate") is True          # 默认拦截,不改任何 qty
         dev = device_service.list_devices(root, q="C25704")["items"][0]
-        assert dev["qty"] == 8       # 4 + 4
+        assert dev["qty"] == 4                       # 未翻倍
+        s3 = importer.import_files(root, [{"path": str(f), "filename": "order.xlsx"}],
+                                   force=True)
+        assert s3["merged"] == 2                     # 显式确认后合并
+        dev = device_service.list_devices(root, q="C25704")["items"][0]
+        assert dev["qty"] == 8                       # 4 + 4
 
 
 class TestOrderCsv:

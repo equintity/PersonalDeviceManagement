@@ -71,6 +71,40 @@ CREATE TABLE IF NOT EXISTS import_logs (
     errors     TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
+
+-- T-M1-01:库存流水(只增不删,审计与撤销依据)
+CREATE TABLE IF NOT EXISTS stock_moves (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  INTEGER NOT NULL,
+    delta      INTEGER NOT NULL,
+    before_qty INTEGER NOT NULL,
+    after_qty  INTEGER NOT NULL,
+    source     TEXT NOT NULL,          -- manual/box_take/box_return/import/adjust/undo
+    ref        TEXT NOT NULL DEFAULT '',
+    cell       INTEGER,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_moves_device ON stock_moves(device_id, id);
+
+-- T-M1-03:操作快照(破坏性映射操作前保存,保留最近 10 条)
+CREATE TABLE IF NOT EXISTS snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,        -- clear_box/auto_arrange/resize/pre_restore
+    payload_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+-- T-M2-01:导入批次幂等登记(同一文件默认不重复入库)
+CREATE TABLE IF NOT EXISTS import_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    source_name     TEXT NOT NULL DEFAULT '',
+    stats_json      TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batches_key ON import_batches(idempotency_key);
 """
 
 # 增量迁移:旧库补列(幂等)
@@ -81,6 +115,7 @@ _MIGRATION_COLUMNS = {
         "price_status": "TEXT NOT NULL DEFAULT ''",     # ''未刷新 / ok / no_match / discontinued / error
         "price_updated_at": "TEXT",                     # 最近一次价格刷新时间(UTC)
         "price_source": "TEXT NOT NULL DEFAULT ''",     # lcsc / jlcpcb
+        "deleted_at": "TEXT",                           # T-M1-03:软删除时间(NULL=在库)
     },
 }
 
@@ -133,6 +168,39 @@ def _migrate(conn: sqlite3.Connection) -> None:
             if col not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# 备份(T-M1-04):基于 sqlite backup API 的一致性快照
+# ---------------------------------------------------------------------------
+def backup_db(root, dest: Path) -> Path:
+    """把当前数据库做一致性快照到 dest(在线备份,不阻塞写入)。"""
+    src = get_db(root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dst = sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+    return dest
+
+
+def daily_backup(root, *, keep: int = 7) -> Path | None:
+    """启动时自动日备份到 <数据根>/backups/,保留最近 keep 份。"""
+    if not db_path(root).exists():
+        return None
+    bdir = as_data(root) / "data" / "backups"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    dest = bdir / f"pdl-{stamp}.db"
+    try:
+        if not dest.exists():
+            backup_db(root, dest)
+        files = sorted(bdir.glob("pdl-*.db"))
+        for old in files[:-keep]:
+            old.unlink(missing_ok=True)
+        return dest
+    except (OSError, sqlite3.Error):
+        return None
 
 
 def row_to_device(row: sqlite3.Row) -> dict:

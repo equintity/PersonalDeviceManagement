@@ -12,7 +12,7 @@ from .paths import AppPaths, as_resources
 from .services import boxmap
 from .services.serial_bridge import SerialBridge
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # 安全响应头:本地应用也按“最小权限”原则收紧
 _SECURITY_HEADERS = {
@@ -65,6 +65,11 @@ def create_app(project_root: str | Path | None = None, *,
     app.config["JSON_AS_ASCII"] = False
 
     init_db(paths)
+    try:
+        from .db import daily_backup
+        daily_backup(paths)         # T-M1-04:启动自动日备份,保留 7 份
+    except Exception:               # 备份失败不阻断启动
+        pass
 
     from .api import _ctx, bp  # 延迟导入避免循环
     import threading

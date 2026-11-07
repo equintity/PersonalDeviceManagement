@@ -94,6 +94,7 @@ static void move_cursor(int8_t dx, int8_t dy) {
     if (nc >= BOX_COLS) nc = 0;
     s_cursor = static_cast<uint16_t>(nr * BOX_COLS + nc);
     led_matrix::set_cursor(s_cursor);
+    protocol::send_cursor(s_cursor);   // 光标事件回传,软件同步显示
     render_current();
 }
 

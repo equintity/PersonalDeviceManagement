@@ -96,7 +96,7 @@
   function renderDeviceTable() {
     const tbody = $("deviceTbody");
     if (!state.devices.length) {
-      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--fg-dim);padding:30px">
+      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--fg-dim);padding:30px">
         暂无器件。点击「批量导入」导入立创商城订单,或「＋新建器件」手工添加。</td></tr>`;
     } else {
       tbody.innerHTML = state.devices.map((d) => {
@@ -204,6 +204,25 @@
   });
   $("btnExport").addEventListener("click", () => { location.href = "/api/export/devices.csv"; });
 
+  /* ---- 备份与恢复(T-M1-04) ---- */
+  $("btnBackup").addEventListener("click", () => { location.href = "/api/backup/export"; });
+  $("btnRestore").addEventListener("click", () => $("restoreFile").click());
+  $("restoreFile").addEventListener("change", async () => {
+    const f = $("restoreFile").files[0];
+    if (!f) return;
+    if (!confirm("恢复将覆盖当前全部数据(器件/映射/流水)。当前库会先自动备份,可放心继续。确定恢复?")) {
+      $("restoreFile").value = ""; return;
+    }
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      const r = await api("/backup/import", { method: "POST", form: fd });
+      toast(`恢复完成:在库器件 ${r.devices} 件(恢复前数据已自动备份)`, "ok");
+      setTimeout(() => location.reload(), 1600);   // 完成提示驻留 ≥1.5s 再刷新
+    } catch (err) { toast(`恢复失败:${err.message}`, "err"); }
+    $("restoreFile").value = "";
+  });
+
   /* ---- 新建/编辑器件弹窗 ---- */
   function openDeviceModal(id = null) {
     const dev = id ? state.devices.find((d) => d.id === id) : null;
@@ -230,12 +249,38 @@
       <label>备注<input id="mNotes" value="${esc(dev?.notes || "")}"></label>
       <label>自定义属性(JSON,可选)<textarea id="mAttrs"
         placeholder='{"耐压":"50V","精度":"±10%"}'>${esc(dev && Object.keys(dev.attrs || {}).length ? JSON.stringify(dev.attrs, null, 0) : "")}</textarea></label>
+      <div id="mMovesWrap" class="${dev ? "" : "hidden"}">
+        <label>库存流水(最近 8 条,可撤销)</label>
+        <div id="mMoves" class="muted">加载中…</div>
+      </div>
       <div class="actions">
         <button id="mCancel">取消</button>
         <button id="mSave" class="primary">保存</button>
       </div>`);
     m.querySelector("#mCancel").addEventListener("click", closeModal);
     m.querySelector("#mName").focus();
+    // 库存流水时间线(T-M1-02):可逐条撤销,历史只增不删
+    if (dev) {
+      api(`/devices/${dev.id}/moves?limit=8`).then((moves) => {
+        const box = m.querySelector("#mMoves");
+        if (!moves.length) { box.textContent = "暂无流水记录"; return; }
+        box.innerHTML = `<ul class="sum-list">${moves.map((mv) => `
+          <li>${esc(mv.created_at.slice(0, 16).replace("T", " "))} · ${esc(mv.source)}
+            · <b>${mv.delta > 0 ? "+" : ""}${mv.delta}</b> → 结余 ${mv.after_qty}
+            ${mv.note ? ` <span class="muted">${esc(mv.note)}</span>` : ""}
+            <button class="pv-del" data-move="${mv.id}" title="撤销该次变动">↩</button></li>`).join("")}</ul>`;
+        box.querySelectorAll("[data-move]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            if (!confirm("撤销该次库存变动?(写入一条撤销记录,历史不删除)")) return;
+            try {
+              await api(`/moves/${btn.dataset.move}/undo`, { method: "POST" });
+              toast("库存已回退", "ok");
+              closeModal(); openDeviceModal(dev.id); loadDevices(); loadBox();
+            } catch (err) { toast(`撤销失败:${err.message}`, "err"); }
+          });
+        });
+      }).catch(() => { m.querySelector("#mMoves").textContent = "流水加载失败"; });
+    }
     m.querySelector("#mSave").addEventListener("click", async () => {
       let attrs = {};
       const attrsRaw = m.querySelector("#mAttrs").value.trim();
@@ -307,7 +352,16 @@
         for (const f of files) fd.append("files", f);
         fd.append("fetch_details",
           m.querySelector("#impFetchFiles").checked ? "1" : "0");
-        const r = await api("/import/files", { method: "POST", form: fd });
+        let r = await api("/import/files", { method: "POST", form: fd });
+        if (r.duplicate) {   // T-M2-01:重复批次,用户显式确认后才累加
+          const prev = r.previous?.[0] || {};
+          const again = confirm(`该文件已于 ${prev.created_at || "之前"} 导入过` +
+            `(新增 ${prev.stats?.imported ?? "?"} / 合并 ${prev.stats?.merged ?? "?"})。` +
+            "确定要再次导入并累加数量吗?");
+          if (!again) { btn.disabled = false; btn.textContent = "导入文件"; return; }
+          fd.append("force", "1");
+          r = await api("/import/files", { method: "POST", form: fd });
+        }
         const msgs = [`新增 ${r.imported} 件,合并 ${r.merged} 件`];
         if (r.errors?.length) msgs.push(`警告:${r.errors.join(";")}`);
         toast(msgs.join("。"), r.errors?.length ? "warn" : "ok");
@@ -514,6 +568,24 @@
   }
 
   /* ================= 器件盒映射(需求 2、3) ================= */
+  async function refreshUndoBtn() {
+    try {
+      const snaps = await api("/snapshots?limit=1");
+      $("btnUndoSnapshot").classList.toggle("hidden", !snaps.length);
+    } catch { $("btnUndoSnapshot").classList.add("hidden"); }
+  }
+
+  $("btnUndoSnapshot").addEventListener("click", async () => {
+    if (!confirm("撤销上一步映射操作,恢复到操作前的布局?")) return;
+    try {
+      const snaps = await api("/snapshots?limit=1");
+      if (!snaps.length) return toast("没有可撤销的快照", "warn");
+      const r = await api(`/snapshots/${snaps[0].id}/restore`, { method: "POST" });
+      toast(`已恢复 ${r.restored} 个格位映射(来源:${r.from_kind})`, "ok");
+      await loadBox(); refreshUndoBtn();
+    } catch (err) { toast(`撤销失败:${err.message}`, "err"); }
+  });
+
   async function loadBox() {
     state.box = await api("/box");
     const { config, mappings } = state.box;
@@ -539,6 +611,7 @@
     grid.innerHTML = html;
     if (state.selectedCell >= config.cells) state.selectedCell = -1;
     fillCellPanel();
+    refreshUndoBtn();
   }
 
   function fillConfigForm() {

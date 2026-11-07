@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import re
@@ -49,12 +50,33 @@ _LCSC_FIELDS = ("category", "package", "manufacturer", "description")
 # ---------------------------------------------------------------------------
 # 途径 1:订单文件导入
 # ---------------------------------------------------------------------------
-def import_files(project_root, file_items: list[dict], *, fetch_details: bool = False) -> dict:
-    """file_items: [{path, filename}]。返回汇总统计。"""
+def import_files(project_root, file_items: list[dict], *, fetch_details: bool = False,
+                 force: bool = False) -> dict:
+    """file_items: [{path, filename}]。返回汇总统计。
+
+    T-M2-01 导入幂等:同一文件(内容 sha256)默认不重复入库,
+    返回 duplicate 标记与上次导入记录,用户显式确认(force)后才累加。
+    """
     if not file_items:
         raise security.ValidationError("请选择要导入的文件")
     if len(file_items) > MAX_FILES_PER_BATCH:
         raise security.ValidationError(f"单次最多导入 {MAX_FILES_PER_BATCH} 个文件")
+
+    conn = get_db(project_root)
+    keys: dict[str, dict] = {}
+    for item in file_items:
+        digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+        key = f"file:{digest}"
+        prev = conn.execute(
+            "SELECT created_at, stats_json FROM import_batches WHERE idempotency_key = ?"
+            " ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        if prev:
+            keys[key] = {"source_name": item["filename"], "created_at": prev["created_at"],
+                         "stats": json.loads(prev["stats_json"] or "{}")}
+    if keys and not force:
+        return {"duplicate": True,
+                "previous": list(keys.values()),
+                "imported": 0, "merged": 0, "skipped": 0, "errors": []}
 
     entries: dict[str, int] = {}   # code -> qty 累加
     errors: list[str] = []
@@ -75,6 +97,16 @@ def import_files(project_root, file_items: list[dict], *, fetch_details: bool = 
 
     stats = _upsert_entries(project_root, entries, fetch_details=fetch_details,
                             kind="file", detail=",".join(i["filename"] for i in file_items))
+    now = utc_now()
+    stats_json = json.dumps({"imported": stats["imported"], "merged": stats["merged"]},
+                            ensure_ascii=False)
+    for item in file_items:   # T-M2-01:所有成功导入的文件都登记批次(幂等键)
+        digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+        conn.execute(
+            "INSERT INTO import_batches (idempotency_key, kind, source_name,"
+            " stats_json, created_at) VALUES (?, 'file', ?, ?, ?)",
+            (f"file:{digest}", item["filename"], stats_json, now))
+    conn.commit()
     stats["errors"] = errors
     return stats
 
@@ -278,22 +310,27 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
         name = security.sanitize_text(d.get("name") or code, field="器件名",
                                       max_len=security.MAX_NAME_LEN) or code
         row = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?", (code,)).fetchone()
-        if row:  # 已存在:数量累加,补充缺失的详情
+        if row:  # 已存在:数量累加,补充缺失的详情(T-M1-01:同事务写流水)
+            before = row["qty"]
+            after = min(security.MAX_QTY, before + qty)
             conn.execute(
-                "UPDATE devices SET qty = MIN(?, qty + ?),"
+                "UPDATE devices SET qty = ?,"
                 " category = CASE WHEN category = '' THEN ? ELSE category END,"
                 " package = CASE WHEN package = '' THEN ? ELSE package END,"
                 " manufacturer = CASE WHEN manufacturer = '' THEN ? ELSE manufacturer END,"
                 " description = CASE WHEN description = '' THEN ? ELSE description END,"
                 " price = COALESCE(price, ?), source = 'lcsc', updated_at = ?"
                 " WHERE id = ?",
-                (security.MAX_QTY, qty, d.get("category", ""), d.get("package", ""),
+                (after, d.get("category", ""), d.get("package", ""),
                  d.get("manufacturer", ""), d.get("description", ""),
                  d.get("price"), now, row["id"]),
             )
+            device_service._write_move(conn, row["id"], after - before, before, after,
+                                       source="import", ref=detail[:80],
+                                       note="订单/C编号导入合并")
             merged += 1
         else:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO devices (lcsc_code, name, category, package, manufacturer,"
                 " description, qty, price, attrs, source, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,'lcsc',?,?)",
@@ -303,6 +340,9 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
                  security.sanitize_text(d.get("description", "")),
                  qty, d.get("price"), "{}", now, now),
             )
+            device_service._write_move(conn, cur.lastrowid, qty, 0, qty,
+                                       source="import", ref=detail[:80],
+                                       note="订单/C编号导入新建")
             imported += 1
     conn.execute(
         "INSERT INTO import_logs (kind, detail, imported, merged, skipped, errors, created_at)"
@@ -377,20 +417,28 @@ def import_csv(project_root, file_items: list[dict]) -> dict:
     imported = merged = 0
     now = utc_now()
     for code, name, qty, data in all_entries:
-        existing = conn.execute("SELECT id FROM devices WHERE lcsc_code = ?",
+        existing = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?",
                                 (code,)).fetchone() if code else None
         if existing:
-            conn.execute("UPDATE devices SET qty = MIN(?, qty + ?), updated_at = ? WHERE id = ?",
-                         (security.MAX_QTY, qty, now, existing["id"]))
+            before = existing["qty"]
+            after = min(security.MAX_QTY, before + qty)
+            conn.execute("UPDATE devices SET qty = ?, updated_at = ? WHERE id = ?",
+                         (after, now, existing["id"]))
+            device_service._write_move(conn, existing["id"], after - before,
+                                       before, after, source="import",
+                                       ref="全字段CSV", note="CSV 导入合并")
             merged += 1
         else:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO devices (lcsc_code, name, category, package, manufacturer,"
                 " description, qty, notes, attrs, source, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,'manual',?,?)",
                 (code, name, data["category"], data["package"], data["manufacturer"],
                  data["description"], qty, data["notes"], "{}", now, now),
             )
+            device_service._write_move(conn, cur.lastrowid, qty, 0, qty,
+                                       source="import", ref="全字段CSV",
+                                       note="CSV 导入新建")
             imported += 1
     conn.execute(
         "INSERT INTO import_logs (kind, detail, imported, merged, skipped, errors, created_at)"
@@ -530,17 +578,22 @@ def save_preview(project_root, items) -> dict:
         cycle = security.sanitize_text(raw.get("cycle") or "normal", max_len=20)
         row = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?",
                            (code,)).fetchone()
-        if row:  # 已存在:合并数量 + 刷新价格状态(人工字段不覆盖)
+        if row:  # 已存在:合并数量 + 刷新价格状态(人工字段不覆盖,写流水)
+            before = row["qty"]
+            after = min(security.MAX_QTY, before + qty)
+            status_value = ("discontinued" if cycle != "normal"
+                            else ("ok" if price is not None else "no_match"))
             conn.execute(
-                "UPDATE devices SET qty = MIN(?, qty + ?),"
+                "UPDATE devices SET qty = ?,"
                 " price = ?, price_currency = ?,"
                 " price_status = ?, price_source = 'lcsc', price_updated_at = ?,"
                 " updated_at = ? WHERE id = ?",
-                (security.MAX_QTY, qty, price,
+                (after, price,
                  security.sanitize_text(raw.get("price_currency") or "USD", max_len=6),
-                 "discontinued" if cycle != "normal" else
-                 ("ok" if price is not None else "no_match"),
-                 now, now, row["id"]))
+                 status_value, now, now, row["id"]))
+            device_service._write_move(conn, row["id"], after - before, before, after,
+                                       source="import", ref="一键加载",
+                                       note="C 编号一键加载合并")
             merged += 1
         else:
             status_value = ("discontinued" if cycle != "normal"
@@ -556,6 +609,11 @@ def save_preview(project_root, items) -> dict:
                  qty, price,
                  security.sanitize_text(raw.get("price_currency") or "USD", max_len=6),
                  status_value, now, now, now))
+            new_id = conn.execute(
+                "SELECT id FROM devices WHERE lcsc_code = ?", (code,)).fetchone()["id"]
+            device_service._write_move(conn, new_id, qty, 0, qty,
+                                       source="import", ref="一键加载",
+                                       note="C 编号一键加载新建")
             created += 1
     conn.execute(
         "INSERT INTO import_logs (kind, detail, imported, merged, skipped, errors, created_at)"

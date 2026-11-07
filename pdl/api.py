@@ -17,7 +17,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 
 from . import APP_VERSION
 from . import security
-from .db import db_path
+from .db import db_path, utc_now
 from .paths import as_data
 from .services import boxmap, codegen, devices as device_service, importer, prices
 from .services.serial_bridge import BridgeError, SerialBridge
@@ -147,7 +147,127 @@ def devices_batch_delete():
 
 @bp.post("/devices/<int:device_id>/adjust-qty")
 def devices_adjust(device_id: int):
-    return _ok(device_service.adjust_qty(_root(), device_id, _body().get("delta", 0)))
+    body = _body()
+    delta = security.validate_int(body.get("delta", 0), field="变动量",
+                                  min_val=-1000, max_val=1000)
+    return _ok(device_service.adjust_qty(_root(), device_id, delta, source="manual"))
+
+
+# ---------------------------------------------------------------------------
+# 库存流水与撤销(T-M1-01/02)
+# ---------------------------------------------------------------------------
+@bp.get("/devices/<int:device_id>/moves")
+def moves_list(device_id: int):
+    limit = _int_arg("limit", 50)
+    return _ok(device_service.list_moves(_root(), device_id, limit=limit))
+
+
+@bp.post("/moves/<int:move_id>/undo")
+def moves_undo(move_id: int):
+    return _ok(device_service.undo_move(_root(), move_id))
+
+
+# ---------------------------------------------------------------------------
+# 映射快照与恢复(T-M1-03)
+# ---------------------------------------------------------------------------
+@bp.get("/snapshots")
+def snapshots_list():
+    limit = _int_arg("limit", 10)
+    rows = _ctx["get_db"]().execute(
+        "SELECT id, kind, created_at FROM snapshots ORDER BY id DESC LIMIT ?",
+        (limit,)).fetchall()
+    return _ok([dict(r) for r in rows])
+
+
+@bp.post("/snapshots/<int:snapshot_id>/restore")
+def snapshots_restore(snapshot_id: int):
+    return _ok(boxmap.restore_snapshot(_root(), snapshot_id))
+
+
+# ---------------------------------------------------------------------------
+# 备份与恢复(T-M1-04)
+# ---------------------------------------------------------------------------
+@bp.get("/backup/export")
+def backup_export():
+    import io
+    import zipfile
+    from datetime import datetime, timezone
+
+    from .db import backup_db
+
+    root = _root()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    tmp_db = as_data(root) / "data" / "backups" / f"export-{stamp}.db"
+    backup_db(root, tmp_db)
+    conn = _ctx["get_db"]()
+    manifest = {
+        "app": "PersonalDeviceManagement", "version": APP_VERSION,
+        "created_at": utc_now(),
+        "devices": conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+        "mappings": conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0],
+        "moves": conn.execute("SELECT COUNT(*) FROM stock_moves").fetchone()[0],
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(tmp_db, "pdl.db")
+        z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    tmp_db.unlink(missing_ok=True)
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"pdl-backup-{stamp}.zip")
+
+
+@bp.post("/backup/import")
+def backup_import():
+    import io
+    import sqlite3
+    import zipfile
+
+    from .db import backup_db
+
+    root = _root()
+    fs = request.files.get("file")
+    if not fs or not fs.filename:
+        raise security.ValidationError("请选择备份 zip 文件")
+    if not fs.filename.lower().endswith(".zip"):
+        raise security.ValidationError("备份文件必须是 .zip")
+    blob = fs.read()
+    if len(blob) > 100 * 1024 * 1024:
+        raise security.ValidationError("备份文件超过 100MB 上限")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile as exc:
+        raise security.ValidationError("无效的 zip 文件") from exc
+    names = zf.namelist()
+    if "pdl.db" not in names or "manifest.json" not in names:
+        raise security.ValidationError("备份缺少 pdl.db 或 manifest.json")
+    try:
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+    except ValueError as exc:
+        raise security.ValidationError("manifest.json 损坏") from exc
+    if manifest.get("app") != "PersonalDeviceManagement":
+        raise security.ValidationError("这不是本工具的备份文件")
+
+    # 恢复前自动备份当前库(T-M1-04 要求)
+    safety = backup_db(root, as_data(root) / "data" / "backups" /
+                       f"pre-restore-{utc_now().replace(':', '')}.db")
+    # 校验并恢复:临时落盘 → 校验表结构 → sqlite backup 原子覆盖当前库
+    tmp = as_data(root) / "data" / "backups" / "restore-tmp.db"
+    tmp.write_bytes(zf.read("pdl.db"))
+    src = sqlite3.connect(str(tmp))
+    try:
+        tables = {r[0] for r in src.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"devices", "mappings", "box_config"} <= tables:
+            raise security.ValidationError("备份数据库结构不完整")
+        src.backup(_ctx["get_db"]())
+    finally:
+        src.close()
+        tmp.unlink(missing_ok=True)
+    devices_n = _ctx["get_db"]().execute(
+        "SELECT COUNT(*) FROM devices WHERE deleted_at IS NULL").fetchone()[0]
+    return _ok({"restored": True, "manifest": manifest,
+                "devices": devices_n, "safety_backup": str(safety)})
 
 
 # ---------------------------------------------------------------------------
@@ -194,12 +314,16 @@ def _is_full_field_csv(path: str) -> bool:
 def import_files():
     saved = _save_uploads(request.files.getlist("files"))
     fetch = request.form.get("fetch_details", "0") in ("1", "true", "yes")
+    force = request.form.get("force", "0") in ("1", "true", "yes")
     order_files = [s for s in saved if not (s["path"].lower().endswith(".csv")
                                             and _is_full_field_csv(s["path"]))]
     csv_files = [s for s in saved if s not in order_files]
     total = {"imported": 0, "merged": 0, "skipped": 0, "errors": []}
     if order_files:
-        stats = importer.import_files(_root(), order_files, fetch_details=fetch)
+        stats = importer.import_files(_root(), order_files, fetch_details=fetch,
+                                      force=force)
+        if stats.get("duplicate"):
+            return _ok(stats)   # T-M2-01:重复批次,交由前端二次确认
         for k in ("imported", "merged", "skipped"):
             total[k] += stats.get(k, 0)
         total["errors"].extend(stats.get("errors", []))

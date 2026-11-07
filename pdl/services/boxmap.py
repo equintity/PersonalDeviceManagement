@@ -117,7 +117,9 @@ def update_config(project_root, data: dict) -> dict:
     removed: list[dict] = []
     resized = new_rows != current["rows"] or new_cols != current["cols"]
     if resized:
-        # 先改尺寸再清理越界映射,保留仍在边界内的器件
+        # 先改尺寸再清理越界映射,保留仍在边界内的器件(T-M1-03:可撤销)
+        if conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]:
+            _write_snapshot(conn, "resize")
         removed_rows = conn.execute(
             "SELECT m.row, m.col, d.name FROM mappings m"
             " LEFT JOIN devices d ON d.id = m.device_id"
@@ -184,9 +186,71 @@ def set_mapping(project_root, cell: int, device_id: int | None) -> dict:
             "device": {k: device[k] for k in ("id", "lcsc_code", "name", "qty", "package")}}
 
 
+def _write_snapshot(conn, kind: str) -> int:
+    """T-M1-03:破坏性映射操作前保存快照,保留最近 10 条。"""
+    rows = conn.execute(
+        "SELECT row, col, device_id FROM mappings ORDER BY row, col").fetchall()
+    payload = json.dumps([dict(r) for r in rows], ensure_ascii=False)
+    conn.execute(
+        "INSERT INTO snapshots (kind, payload_json, created_at) VALUES (?,?,?)",
+        (kind, payload, utc_now()))
+    conn.execute(
+        "DELETE FROM snapshots WHERE id NOT IN"
+        " (SELECT id FROM snapshots ORDER BY id DESC LIMIT 10)")
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def latest_snapshot(project_root) -> dict | None:
+    row = get_db(project_root).execute(
+        "SELECT id, kind, created_at FROM snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def restore_snapshot(project_root, snapshot_id: int) -> dict:
+    """T-M1-03:恢复映射快照(恢复前先对当前状态再做一次快照,可撤销恢复)。"""
+    snapshot_id = security.validate_int(snapshot_id, field="快照ID",
+                                        min_val=1, max_val=2**31 - 1)
+    conn = get_db(project_root)
+    row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+    if row is None:
+        raise security.ValidationError(f"快照不存在:id={snapshot_id}")
+    try:
+        payload = json.loads(row["payload_json"])
+    except ValueError as exc:
+        raise security.ValidationError("快照数据损坏") from exc
+    if not isinstance(payload, list):
+        raise security.ValidationError("快照数据损坏")
+    # 恢复前快照当前状态(撤销恢复 = 再恢复这条 pre_restore)
+    pre_id = _write_snapshot(conn, "pre_restore")
+    conn.execute("DELETE FROM mappings")
+    restored = 0
+    for m in payload:
+        if not isinstance(m, dict):
+            continue
+        try:
+            r = security.validate_int(m.get("row"), field="行", min_val=0,
+                                      max_val=security.MAX_ROWS)
+            c = security.validate_int(m.get("col"), field="列", min_val=0,
+                                      max_val=security.MAX_COLS)
+        except security.ValidationError:
+            continue
+        device_id = m.get("device_id")
+        conn.execute(
+            "INSERT OR REPLACE INTO mappings (row, col, device_id) VALUES (?,?,?)",
+            (r, c, device_id if isinstance(device_id, int) else None))
+        restored += 1
+    conn.commit()
+    _notify_sync(project_root)
+    return {"restored": restored, "from_kind": row["kind"],
+            "safety_snapshot": pre_id}
+
+
 def clear_box(project_root) -> int:
     conn = get_db(project_root)
     n = conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[0]
+    if n:
+        _write_snapshot(conn, "clear_box")   # T-M1-03:可撤销
     conn.execute("DELETE FROM mappings")
     conn.commit()
     _notify_sync(project_root)
@@ -197,8 +261,9 @@ def auto_arrange(project_root) -> dict:
     """一键排布:按 更新时间倒序 把器件依次填入格位(需求 3 的“映射关系动态配置”)。"""
     cfg = get_config(project_root)
     conn = get_db(project_root)
+    _write_snapshot(conn, "auto_arrange")    # T-M1-03:可撤销
     devices = conn.execute(
-        "SELECT id FROM devices ORDER BY updated_at DESC LIMIT ?",
+        "SELECT id FROM devices WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?",
         (cfg["cells"],)).fetchall()
     conn.execute("DELETE FROM mappings")
     for i, d in enumerate(devices):

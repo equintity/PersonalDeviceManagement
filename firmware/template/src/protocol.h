@@ -12,6 +12,8 @@ void send_hello();
 void send_pong();
 void send_ready(uint16_t mapped);
 void send_stock(const char* evt, uint16_t cell, uint32_t qty);  // take / return
+void send_cursor(uint16_t cell);                                 // 硬件光标移动
+void send_lit(int16_t cell);                                     // 点亮确认(-1=熄灭)
 void send_log(const char* msg);
 
 }  // namespace protocol

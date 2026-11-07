@@ -18,7 +18,8 @@ from pathlib import Path
 from . import boxmap, devices
 
 BAUD = 115200
-MAX_LINE = 512            # 单条消息最大字节数,防缓冲区滥用
+MAX_LINE = 1024           # 单条消息最大字节数(T-M4-01:512→1024,容纳分帧 sync)
+SYNC_CHUNK = 8            # T-M3-01:sync 每批最多 8 个映射,分帧送达
 EVENT_BUFFER = 200
 
 # 软件 → 硬件 命令白名单
@@ -46,6 +47,7 @@ class VirtualBox:
         self._cursor = 0
         self._lit = -1
         self._items: dict[int, dict] = {}
+        self._sync_buf: dict[int, dict] = {}   # 分帧 sync 的累积缓冲
         self._open = True
 
     def write_line(self, line: str) -> None:
@@ -68,10 +70,19 @@ class VirtualBox:
                 self._lit = -1
                 self._emit("lit", {"cell": -1})
             elif action == "sync":
-                self._items = {int(i["cell"]): {"qty": int(i["qty"])}
-                               for i in cmd.get("items", []) if isinstance(i, dict)}
-                self._emit("ready", {"mapped": len(self._items),
-                                     "msg": "虚拟盒:映射已同步"})
+                # 与固件同语义:seq/total 分帧累积,末批统一生效并回 ready
+                seq = int(cmd.get("seq", 1) or 1)
+                total = int(cmd.get("total", 1) or 1)
+                if seq <= 1:
+                    self._sync_buf = {}
+                for i in cmd.get("items", []):
+                    if isinstance(i, dict) and "cell" in i:
+                        self._sync_buf[int(i["cell"])] = {"qty": int(i.get("qty", 0))}
+                if seq >= total:
+                    self._items = dict(self._sync_buf)
+                    self._sync_buf = {}
+                    self._emit("ready", {"mapped": len(self._items),
+                                         "msg": "虚拟盒:映射已同步"})
             elif action == "qty":
                 cell = cmd.get("cell")
                 if cell in self._items:
@@ -197,8 +208,12 @@ class SerialBridge:
                                             name="pdl-serial-reader")
             self._reader.start()
             self._push_event("sys", {"msg": f"已连接 {port}"})
-            # 连接后立即推送完整映射与库存(联动建立)
-            self.push_sync()
+            # 连接后立即推送完整映射与库存(T-M3-01:失败不阻断连接,
+            # 提示"映射同步待重试",可经「同步映射到硬件」按钮重试)
+            try:
+                self.push_sync()
+            except Exception as exc:  # noqa: BLE001
+                self._push_event("sys", {"msg": f"已连接(映射同步待重试):{exc}"})
             self.send_command("info")
             return self.status()
 
@@ -254,13 +269,28 @@ class SerialBridge:
             return True
 
     def push_sync(self) -> bool:
-        """把当前全部映射+库存推送到硬件(联动核心)。"""
+        """把当前全部映射+库存推送到硬件(联动核心)。
+
+        T-M3-01:按每批 ≤SYNC_CHUNK 条分帧发送(seq/total),
+        固件累计后在末批统一回 ready{mapped},63 格满映射不再超长。
+        """
         box = boxmap.get_box(self.project_root)
         items = [{"cell": m["cell"], "qty": m["device"]["qty"],
                   "code": m["device"]["lcsc_code"] or ""}
                  for m in box["mappings"] if m["device"]]
-        return self.send_command("sync", rows=box["config"]["rows"],
-                                 cols=box["config"]["cols"], items=items)
+        rows, cols = box["config"]["rows"], box["config"]["cols"]
+        if not items:
+            return self.send_command("sync", rows=rows, cols=cols,
+                                     seq=1, total=1, items=[])
+        chunks = [items[i:i + SYNC_CHUNK] for i in range(0, len(items), SYNC_CHUNK)]
+        total = len(chunks)
+        ok_all = True
+        for seq, chunk in enumerate(chunks, 1):
+            if not self.send_command("sync", rows=rows, cols=cols,
+                                     seq=seq, total=total, items=chunk):
+                ok_all = False
+                break
+        return ok_all
 
     def light_cell(self, cell: int, on: bool = True) -> bool:
         cell = int(cell)
@@ -339,7 +369,9 @@ class SerialBridge:
                 return
             device_id = mapping["device"]["id"]
             updated = devices.adjust_qty(
-                self.project_root, device_id, -1 if evt == "take" else 1)
+                self.project_root, device_id, -1 if evt == "take" else 1,
+                source="box_take" if evt == "take" else "box_return",
+                cell=cell, note="器件盒按键联动")
             self.send_command("qty", cell=cell, qty=updated["qty"])
             self._push_event("sys", {
                 "msg": f"{'取料' if evt == 'take' else '退料'}联动:"

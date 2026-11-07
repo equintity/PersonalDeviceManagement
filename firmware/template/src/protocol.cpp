@@ -60,6 +60,20 @@ void protocol::send_stock(const char* evt, uint16_t cell, uint32_t qty) {
     send_json(doc);
 }
 
+void protocol::send_cursor(uint16_t cell) {
+    JsonDocument doc;
+    doc["evt"] = "cursor";
+    doc["cell"] = cell;
+    send_json(doc);
+}
+
+void protocol::send_lit(int16_t cell) {
+    JsonDocument doc;
+    doc["evt"] = "lit";
+    doc["cell"] = cell;
+    send_json(doc);
+}
+
 void protocol::send_log(const char* msg) {
     JsonDocument doc;
     doc["evt"] = "log";
@@ -68,7 +82,7 @@ void protocol::send_log(const char* msg) {
 }
 
 namespace {
-constexpr size_t kMaxLine = 512;
+constexpr size_t kMaxLine = 1024;   // T-M4-01:512→1024,容纳分帧 sync(每批 ≤8 项)
 
 // 严格取整数:类型不符或越界返回 false
 bool get_int(const JsonDocument& doc, const char* key, long min_v, long max_v, long& out) {
@@ -94,9 +108,14 @@ void handle_line(const char* line) {
             protocol::send_log("bad cell"); return;
         }
         app::remote_light(static_cast<int16_t>(cell));
+        protocol::send_lit(static_cast<int16_t>(cell));   // 点亮回执
         return;
     }
-    if (strcmp(cmd, "off") == 0) { app::remote_light(-1); return; }
+    if (strcmp(cmd, "off") == 0) {
+        app::remote_light(-1);
+        protocol::send_lit(-1);
+        return;
+    }
 
     if (strcmp(cmd, "qty") == 0) {
         long cell, qty;
@@ -110,6 +129,13 @@ void handle_line(const char* line) {
     }
 
     if (strcmp(cmd, "sync") == 0) {
+        // T-M4-01:增量分帧 sync —— seq/total 分批送达,固件累计,
+        // 末批(seq >= total)统一回 ready{mapped: 累计};无 seq 字段时按单批兼容
+        static uint16_t accum = 0;
+        static bool active = false;
+        const long seq = doc["seq"] | 1;
+        const long total = doc["total"] | 1;
+        if (seq <= 1) { accum = 0; active = true; }
         uint16_t mapped = 0;
         JsonArrayConst items = doc["items"].as<JsonArrayConst>();
         if (!items.isNull()) {
@@ -124,7 +150,12 @@ void handle_line(const char* line) {
                 mapped++;
             }
         }
-        protocol::send_ready(mapped);
+        accum += mapped;
+        if (seq >= total) {
+            if (active) protocol::send_ready(accum);
+            accum = 0;
+            active = false;
+        }
         return;
     }
 
@@ -157,6 +188,10 @@ void protocol::poll() {
         }
         if (c == '\r' || c == '\t' || static_cast<uint8_t>(c) < 0x20) continue;
         if (len < kMaxLine) buf[len++] = c;
-        else { len = 0; protocol::send_log("line too long"); }  // 超长直接丢弃
+        else {
+            // T-M4-01:超长行不再静默丢弃,回显明确错误事件
+            len = 0;
+            protocol::send_log("error: line too long, dropped");
+        }
     }
 }

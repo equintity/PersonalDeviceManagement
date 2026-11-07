@@ -67,7 +67,7 @@ def list_devices(
     }
     order = sort_map.get(sort, sort_map["updated_desc"])
 
-    where, params = ["1=1"], []
+    where, params = ["deleted_at IS NULL"], []
     if q:
         q = security.sanitize_text(q, field="搜索词", max_len=80)
         if q:
@@ -133,6 +133,7 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
         raise security.ValidationError(f"器件不存在:id={device_id}")
 
     updates, params = [], []
+    old_qty = None
     if "name" in data:
         updates.append("name = ?")
         params.append(security.validate_device_name(data.get("name")))
@@ -143,6 +144,8 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
         updates.append("model = ?")
         params.append(security.validate_model(data.get("model")))
     if "qty" in data:
+        old_qty = conn.execute("SELECT qty FROM devices WHERE id = ?",
+                               (device_id,)).fetchone()["qty"]
         updates.append("qty = ?")
         params.append(security.validate_int(data.get("qty", 0), field="库存数量",
                                             min_val=0, max_val=security.MAX_QTY))
@@ -164,6 +167,14 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
     params.append(device_id)
     try:
         conn.execute(f"UPDATE devices SET {', '.join(updates)} WHERE id = ?", params)
+        # T-M1-01:手工改数量与 qty 更新同事务写流水
+        if old_qty is not None:
+            new_qty = conn.execute("SELECT qty FROM devices WHERE id = ?",
+                                   (device_id,)).fetchone()["qty"]
+            delta = new_qty - old_qty
+            if delta != 0:
+                _write_move(conn, device_id, delta, old_qty, new_qty,
+                            source="manual", note="手工修改数量")
         conn.commit()
     except sqlite3.IntegrityError:
         raise security.ValidationError("更新失败:C编号已存在") from None
@@ -173,7 +184,7 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
 def get_device(project_root, device_id: int) -> dict:
     device_id = security.validate_int(device_id, field="器件ID", min_val=1, max_val=2**31 - 1)
     row = get_db(project_root).execute(
-        "SELECT * FROM devices WHERE id = ?", (device_id,)
+        "SELECT * FROM devices WHERE id = ? AND deleted_at IS NULL", (device_id,)
     ).fetchone()
     if row is None:
         raise security.ValidationError(f"器件不存在:id={device_id}")
@@ -181,24 +192,81 @@ def get_device(project_root, device_id: int) -> dict:
 
 
 def delete_devices(project_root, ids: list[int]) -> int:
+    """T-M1-03 软删除:标记 deleted_at 并解除关联映射,可找回、编号保留。"""
     ids = security.validate_id_list(ids, field="器件ID列表")
     conn = get_db(project_root)
     marks = ",".join("?" * len(ids))
-    cur = conn.execute(f"DELETE FROM devices WHERE id IN ({marks})", ids)
+    now = utc_now()
+    cur = conn.execute(
+        f"UPDATE devices SET deleted_at = ? WHERE id IN ({marks}) AND deleted_at IS NULL",
+        (now, *ids))
+    conn.execute(
+        f"UPDATE mappings SET device_id = NULL WHERE device_id IN ({marks})", ids)
     conn.commit()
     return cur.rowcount
 
 
-def adjust_qty(project_root, device_id: int, delta: int) -> dict:
-    """取料/退料联动:库存增减,下限 0。delta 限制在 ±1000 内。"""
+def list_moves(project_root, device_id: int, limit: int = 50) -> list[dict]:
+    """T-M1-02:库存流水(时间倒序,只增不删)。"""
     device_id = security.validate_int(device_id, field="器件ID", min_val=1, max_val=2**31 - 1)
-    delta = security.validate_int(delta, field="变动量", min_val=-1000, max_val=1000)
+    limit = security.validate_int(limit, field="条数", min_val=1, max_val=200)
+    rows = get_db(project_root).execute(
+        "SELECT * FROM stock_moves WHERE device_id = ? ORDER BY id DESC LIMIT ?",
+        (device_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def undo_move(project_root, move_id: int) -> dict:
+    """T-M1-02:按反向 delta 撤销一条流水(写 undo 记录,不删除原记录)。"""
+    move_id = security.validate_int(move_id, field="流水ID", min_val=1, max_val=2**31 - 1)
     conn = get_db(project_root)
-    cur = conn.execute(
-        "UPDATE devices SET qty = MAX(0, MIN(?, qty + ?)), updated_at = ? WHERE id = ?",
-        (security.MAX_QTY, delta, utc_now(), device_id),
-    )
-    conn.commit()
-    if cur.rowcount == 0:
+    move = conn.execute("SELECT * FROM stock_moves WHERE id = ?", (move_id,)).fetchone()
+    if move is None:
+        raise security.ValidationError(f"流水不存在:id={move_id}")
+    updated = adjust_qty(project_root, move["device_id"], -move["delta"],
+                         source="undo", cell=move["cell"],
+                         note=f"撤销流水#{move['id']}")
+    return {"move_id": move_id, "device": updated}
+
+
+def _write_move(conn, device_id: int, delta: int, before: int, after: int, *,
+                source: str, ref: str = "", cell: int | None = None,
+                note: str = "") -> None:
+    """T-M1-01:任何库存变化必须与 qty 更新同事务写流水(只增不删)。"""
+    conn.execute(
+        "INSERT INTO stock_moves (device_id, delta, before_qty, after_qty,"
+        " source, ref, cell, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (device_id, delta, before, after, source, ref, cell, note, utc_now()))
+
+
+def adjust_qty(project_root, device_id: int, delta: int, *,
+               source: str = "manual", cell: int | None = None,
+               note: str = "", ref: str = "") -> dict:
+    """取料/退料等库存增减:T-M1-01 要求与流水同事务写入。
+
+    source ∈ {manual, box_take, box_return, import, adjust, undo}。
+    结果量夹在 [0, MAX_QTY],流水记录实际发生的 before/after。
+    """
+    device_id = security.validate_int(device_id, field="器件ID", min_val=1, max_val=2**31 - 1)
+    delta = security.validate_int(delta, field="变动量", min_val=-security.MAX_QTY,
+                                  max_val=security.MAX_QTY)
+    if source not in ("manual", "box_take", "box_return", "import", "adjust", "undo"):
+        raise security.ValidationError(f"未知的流水来源:{source!r}")
+    conn = get_db(project_root)
+    row = conn.execute("SELECT qty FROM devices WHERE id = ? AND deleted_at IS NULL",
+                       (device_id,)).fetchone()
+    if row is None:
         raise security.ValidationError(f"器件不存在:id={device_id}")
+    before = row["qty"]
+    after = max(0, min(security.MAX_QTY, before + delta))
+    actual = after - before
+    if actual != delta:
+        note = (note + ";") if note else ""
+        note += f"目标 {delta} 因边界截断为 {actual}"
+    conn.execute(
+        "UPDATE devices SET qty = ?, updated_at = ? WHERE id = ?",
+        (after, utc_now(), device_id))
+    _write_move(conn, device_id, actual, before, after, source=source,
+                ref=ref, cell=cell, note=note)
+    conn.commit()
     return get_device(project_root, device_id)

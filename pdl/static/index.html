@@ -32,6 +32,9 @@
       <button id="btnAddDevice" class="primary">＋ 新建器件</button>
       <button id="btnImport">⬇ 批量导入</button>
       <button id="btnRefreshPrices">⟳ 刷新价格</button>
+      <button id="btnBackup" title="导出完整备份(zip,含映射/配置/流水)">💾 备份</button>
+      <button id="btnRestore" title="从备份 zip 恢复(当前库自动先备份)">恢复</button>
+      <input type="file" id="restoreFile" accept=".zip" class="hidden">
       <button id="btnExport">导出 CSV</button>
       <span class="spacer"></span>
       <button id="btnBatchDelete" class="danger">删除选中</button>
@@ -126,6 +129,7 @@
       <div class="box-head">
         <h2 id="boxTitle">器件盒</h2>
         <span class="spacer"></span>
+        <button id="btnUndoSnapshot" class="hidden" title="恢复最近一次破坏性操作前的映射">↩ 撤销上一步</button>
         <button id="btnAutoArrange">⚡ 一键排布</button>
         <button id="btnClearBox" class="danger">清空映射</button>
       </div>
