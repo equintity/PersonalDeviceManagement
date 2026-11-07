@@ -31,6 +31,29 @@
     return data.data;
   }
 
+  /* T6:写操作成功但同步到盒子失败时,给出原因 + 重试按钮 */
+  function checkSync(r) {
+    if (!r || !r.sync || r.sync.sent !== false) return;
+    const el = document.createElement("div");
+    el.className = "toast warn";
+    const text = document.createElement("span");
+    text.textContent = `已保存,但同步到盒子失败:${r.sync.reason || "未知原因"}`;
+    const retry = document.createElement("button");
+    retry.textContent = "重试";
+    retry.style.marginLeft = "8px";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      try {
+        const rr = await api("/serial/sync", { method: "POST" });
+        if (rr.sent) { toast("已重试同步成功", "ok"); el.remove(); }
+        else { text.textContent = `同步仍失败:${rr.reason || "未知原因"}`; retry.disabled = false; }
+      } catch (err) { text.textContent = `同步仍失败:${err.message}`; retry.disabled = false; }
+    });
+    el.append(text, retry);
+    $("toasts").appendChild(el);
+    setTimeout(() => el.remove(), 8000);   // 带按钮的提示驻留更久
+  }
+
   function toast(msg, cls = "") {
     const el = document.createElement("div");
     el.className = `toast ${cls}`;
@@ -589,11 +612,13 @@
 
   $("btnUndoSnapshot").addEventListener("click", async () => {
     if (!confirm("撤销上一步映射操作,恢复到操作前的布局?")) return;
+    // 快照恢复结果同样经 checkSync 报告同步状态
     try {
       const snaps = await api("/snapshots?limit=1");
       if (!snaps.length) return toast("没有可撤销的快照", "warn");
       const r = await api(`/snapshots/${snaps[0].id}/restore`, { method: "POST" });
       toast(`已恢复 ${r.restored} 个格位映射(来源:${r.from_kind})`, "ok");
+      checkSync(r);
       await loadBox(); refreshUndoBtn();
     } catch (err) { toast(`撤销失败:${err.message}`, "err"); }
   });
@@ -672,6 +697,7 @@
       if (r.removed_mappings?.length)
         toast(`尺寸已调整,${r.removed_mappings.length} 个超出边界的映射被移除`, "warn");
       else toast(okMsg || "配置已保存", "ok");
+      checkSync(r);
       await loadBox(); fillConfigForm();
     } catch (err) { toast(err.message, "err"); }
   }
@@ -701,13 +727,15 @@
     if (!confirm("按器件库最新顺序一键填充全部格位?现有映射会被重排。")) return;
     const r = await api("/box/auto-arrange", { method: "POST" });
     toast(`已排布 ${r.assigned} 个器件`, "ok");
-    loadBox();
+    checkSync(r);
+    await loadBox();
   });
   $("btnClearBox").addEventListener("click", async () => {
     if (!confirm("确认清空全部格位映射?")) return;
-    await api("/box/clear", { method: "POST" });
+    const r = await api("/box/clear", { method: "POST" });
     toast("映射已清空", "ok");
-    loadBox();
+    checkSync(r);
+    await loadBox();
   });
 
   /* ---- 分配器件选择器 ---- */
@@ -739,8 +767,9 @@
       const item = e.target.closest(".picker-item");
       if (!item?.dataset.id) return;
       const cell = state.selectedCell;
-      await api("/box/mapping", { json: { cell, device_id: Number(item.dataset.id) } });
+      const r = await api("/box/mapping", { json: { cell, device_id: Number(item.dataset.id) } });
       toast(`已映射到格位 #${cell}`, "ok");
+      checkSync(r);
       closeModal();
       await loadBox();
       flashCell(cell, "flash-ok");   // 分配完成态停留 ≥1.5s
@@ -749,8 +778,9 @@
 
   $("btnClearCell").addEventListener("click", async () => {
     if (state.selectedCell < 0) return;
-    await api(`/box/mapping/${state.selectedCell}`, { method: "DELETE" });
+    const r = await api(`/box/mapping/${state.selectedCell}`, { method: "DELETE" });
     toast("已解除映射", "ok");
+    checkSync(r);
     await loadBox();
     flashCell(state.selectedCell, "flash-err");   // 解除=橙红闪烁 ≥1.5s
   });

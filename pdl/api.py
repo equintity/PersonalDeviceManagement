@@ -659,7 +659,12 @@ def serial_events():
 def serial_sync():
     if not _bridge().connected:
         return _fail("器件盒未连接", 409)
-    return _ok({"sent": _bridge().push_sync()})
+    sent = _bridge().push_sync()
+    reason = "" if sent else "推送失败(串口写入异常)"
+    if not sent:
+        _op("serial.sync", "手动同步", reason, ok=False)
+    return _ok({"sent": sent, "reason": reason,
+                "mapped": _bridge().last_ready_mapped})
 
 
 @bp.post("/serial/light")

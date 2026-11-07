@@ -54,6 +54,7 @@ class VirtualBox:
         self._stock_wait: dict | None = None           # T5:request_stock 聚合器
         self._last_error: str | None = None            # T7:断连原因
         self._last_seen: float | None = None           # T7:最近收到数据时刻
+        self.last_ready_mapped: int | None = None      # T6:最近一次 ready.mapped
         self._virtual_box: VirtualBox | None = None    # 虚拟盒实例跨连接持久(等价物理设备)
 
     def write_line(self, line: str) -> None:
@@ -168,6 +169,7 @@ class SerialBridge:
         self._stock_wait: dict | None = None           # T5:request_stock 聚合器
         self._last_error: str | None = None            # T7:断连原因
         self._last_seen: float | None = None           # T7:最近收到数据时刻
+        self.last_ready_mapped: int | None = None      # T6:最近一次 ready.mapped
         self._virtual_box: VirtualBox | None = None    # 虚拟盒实例跨连接持久(等价物理设备)
 
     # -- 事件缓冲 -----------------------------------------------------------
@@ -485,6 +487,8 @@ class SerialBridge:
         clean = {k: doc[k] for k in doc if k != "evt"
                  and isinstance(k, str) and len(k) <= 16}
         self._push_event("in", {"evt": evt, **_clip(clean)})
+        if evt == "ready":
+            self.last_ready_mapped = doc.get("mapped")
         if evt == "stock" and self._stock_wait is not None:
             # T5:聚合分帧差异(仅投喂给等待中的 request_stock)
             for it in doc.get("items", []) or []:

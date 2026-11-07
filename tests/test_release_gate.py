@@ -480,3 +480,28 @@ class TestStockDiff:
         assert r["pending"] is True and len(r["items"]) == 63
         assert all(it["delta"] == -1 for it in r["items"])
         client.post("/api/serial/disconnect")
+
+
+class TestSyncVisibility:
+    """T6/QA-19:同步失败可见,成功静默;配置保存不因同步失败而失败。"""
+
+    def test_no_box_sync_reports_reason(self, client):
+        d = device_create(client, "同步件")
+        r = client.post("/api/box/mapping",
+                        json={"cell": 0, "device_id": d["id"]}).get_json()["data"]
+        assert r["sync"]["sent"] is False
+        assert r["sync"]["reason"]                  # 未连接 → 明确原因
+
+    def test_connected_sync_ok(self, client):
+        d = device_create(client, "同步件2")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.post("/api/box/mapping",
+                        json={"cell": 1, "device_id": d["id"]}).get_json()["data"]
+        assert r["sync"]["sent"] is True
+        client.post("/api/serial/disconnect")
+
+    def test_manual_sync_reports_mapped(self, client):
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.post("/api/serial/sync").get_json()["data"]
+        assert r["sent"] is True and r["mapped"] is not None
+        client.post("/api/serial/disconnect")

@@ -40,12 +40,26 @@ def register_sync_hook(fn) -> None:
     _sync_hooks.append(fn)
 
 
-def _notify_sync(project_root) -> None:
+def _notify_sync(project_root) -> dict:
+    """T6/QA-19:同步失败可见 —— 任一盒子同步成功即成功;
+    全部失败(或无已连接盒子)时返回第一个失败原因并留痕。不阻断配置保存。"""
+    first_failure = ""
+    any_success = False
     for fn in _sync_hooks:
         try:
-            fn(project_root)
-        except Exception:  # 通知失败不影响配置保存
-            pass
+            r = fn(project_root) or {}
+            if r.get("sent") is True:
+                any_success = True
+            elif not first_failure:
+                first_failure = r.get("reason") or "同步失败"
+        except Exception as exc:  # 留痕而非静默(T6:消灭 except pass)
+            from ..db import log_op
+            log_op(project_root, "fail", "box.sync-notify", str(exc), ok=False)
+            if not first_failure:
+                first_failure = f"同步异常:{exc}"
+    if any_success:
+        return {"sent": True, "reason": ""}
+    return {"sent": False, "reason": first_failure or "器件盒未连接"}
 
 
 def get_config(project_root) -> dict:
@@ -136,10 +150,11 @@ def update_config(project_root, data: dict) -> dict:
         params.append(1)
         conn.execute(f"UPDATE box_config SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
-    _notify_sync(project_root)
+    sync = _notify_sync(project_root)
     result = get_config(project_root)
     result["resized"] = resized
     result["removed_mappings"] = removed
+    result["sync"] = sync
     return result
 
 
@@ -172,8 +187,8 @@ def set_mapping(project_root, cell: int, device_id: int | None) -> dict:
     if device_id is None:
         conn.execute("DELETE FROM mappings WHERE row = ? AND col = ?", (row, col))
         conn.commit()
-        _notify_sync(project_root)
-        return {"row": row, "col": col, "cell": cell, "device": None}
+        return {"row": row, "col": col, "cell": cell, "device": None,
+                "sync": _notify_sync(project_root)}
     device_id = security.validate_int(device_id, field="器件ID", min_val=1, max_val=2**31 - 1)
     device = device_service.get_device(project_root, device_id)  # 确认存在
     conn.execute(
@@ -181,8 +196,8 @@ def set_mapping(project_root, cell: int, device_id: int | None) -> dict:
         " ON CONFLICT(row, col) DO UPDATE SET device_id = excluded.device_id",
         (row, col, device_id))
     conn.commit()
-    _notify_sync(project_root)
-    return {"row": row, "col": col, "cell": cell,
+    sync = _notify_sync(project_root)
+    return {"row": row, "col": col, "cell": cell, "sync": sync,
             "device": {k: device[k] for k in ("id", "lcsc_code", "name", "qty", "package")}}
 
 
@@ -241,9 +256,9 @@ def restore_snapshot(project_root, snapshot_id: int) -> dict:
             (r, c, device_id if isinstance(device_id, int) else None))
         restored += 1
     conn.commit()
-    _notify_sync(project_root)
+    sync = _notify_sync(project_root)
     return {"restored": restored, "from_kind": row["kind"],
-            "safety_snapshot": pre_id}
+            "safety_snapshot": pre_id, "sync": sync}
 
 
 def clear_box(project_root) -> int:
@@ -253,8 +268,8 @@ def clear_box(project_root) -> int:
         _write_snapshot(conn, "clear_box")   # T-M1-03:可撤销
     conn.execute("DELETE FROM mappings")
     conn.commit()
-    _notify_sync(project_root)
-    return n
+    sync = _notify_sync(project_root)
+    return {"cleared": n, "sync": sync}
 
 
 def auto_arrange(project_root) -> dict:
@@ -271,5 +286,5 @@ def auto_arrange(project_root) -> dict:
         conn.execute("INSERT OR REPLACE INTO mappings (row, col, device_id) VALUES (?,?,?)",
                      (row, col, d["id"]))
     conn.commit()
-    _notify_sync(project_root)
-    return {"assigned": len(devices), "cells": cfg["cells"]}
+    sync = _notify_sync(project_root)
+    return {"assigned": len(devices), "cells": cfg["cells"], "sync": sync}
