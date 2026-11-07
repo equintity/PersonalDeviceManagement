@@ -69,6 +69,9 @@ def fetch_lcsc_detail(code: str) -> dict | None:
         return None
     d = doc.get("result") or {}
     price, currency = _lcsc_price(d.get("productPriceList"))
+    # 商品名称 = 接口 title 字段(立创商城展示名,即“品牌 + 型号”);
+    # productKeyAttributes/productNameEn 是规格描述,归入 description
+    title = str(d.get("title") or "")
     key_attrs = str(d.get("productKeyAttributes") or "")
     name_en = str(d.get("productNameEn") or "")
     return {
@@ -79,7 +82,8 @@ def fetch_lcsc_detail(code: str) -> dict | None:
         "cycle": str(d.get("productCycle") or "normal")[:20],
         "brand": str(d.get("brandNameEn") or "")[:60],
         "package": str(d.get("encapStandard") or "")[:30],
-        "name": (key_attrs or name_en)[:64],
+        "name": (title or f"{str(d.get('brandNameEn') or '')} "
+                 f"{str(d.get('productModel') or '')}".strip() or name_en)[:64],
         "category": str(d.get("catalogName") or d.get("parentCatalogName") or "")[:40],
         "description": (key_attrs or name_en)[:200],
     }

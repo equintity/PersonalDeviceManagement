@@ -10,7 +10,7 @@ from pdl.services import importer, prices
 def _info(code="C25704", cycle="normal", stock=5000):
     return {"price": 0.0065, "currency": "USD", "model": "1210W3J0563T5E",
             "stock": stock, "cycle": cycle, "brand": "UNI-ROYAL",
-            "package": "1210", "name": "RES 56kohm 1210",
+            "package": "1210", "name": "UNI-ROYAL 1210W3J0563T5E",
             "category": "Chip Resistor", "description": "RES 56kohm 1210"}
 
 
@@ -21,7 +21,7 @@ class TestPreview:
         assert r["invalid"] == []
         it = r["items"][0]
         assert it["code"] == "C25704" and it["status"] == "new"
-        assert it["name"] == "RES 56kohm 1210"
+        assert it["name"] == "UNI-ROYAL 1210W3J0563T5E"  # 商品名称=品牌+型号
         assert it["model"] == "1210W3J0563T5E" and it["package"] == "1210"
         assert it["manufacturer"] == "UNI-ROYAL"
         assert it["price"] == 0.0065
