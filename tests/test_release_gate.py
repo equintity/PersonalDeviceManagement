@@ -505,3 +505,68 @@ class TestSyncVisibility:
         r = client.post("/api/serial/sync").get_json()["data"]
         assert r["sent"] is True and r["mapped"] is not None
         client.post("/api/serial/disconnect")
+
+
+class TestConnectionState:
+    """T7/QA-06:断连可感知、状态真实化、重连不重复扣减。"""
+
+    def test_disconnect_sets_last_error(self, client):
+        device_create(client, "断连件")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        st = client.post("/api/serial/disconnect").get_json()["data"]
+        assert st["connected"] is False
+        assert st["last_error"]                         # 主动断开也有原因
+
+    def test_read_loop_death_realizes_state(self, client, monkeypatch):
+        """虚拟盒等价模拟:write_line 抛 OSError → 心跳发送失败 → 状态真实化。"""
+        import time as _time
+        device_create(client, "异常断开件")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+
+        from pdl.api import _ctx
+        bridge = _ctx["bridge"]
+        conn = bridge._conn
+        original = conn.write_line
+        conn.write_line = lambda *a, **k: (_ for _ in ()).throw(OSError("usb 拔出"))
+        try:
+            deadline = _time.time() + 8       # 心跳周期 5s,8s 内必触发
+            while _time.time() < deadline:
+                st = client.get("/api/serial/status").get_json()["data"]
+                if not st["connected"]:
+                    break
+                _time.sleep(0.2)
+            st = client.get("/api/serial/status").get_json()["data"]
+            assert st["connected"] is False
+            assert st["last_error"]
+        finally:
+            conn.write_line = original
+
+    def test_reconnect_after_death(self, client, monkeypatch):
+        import time as _time
+        dev = device_create(client, "重连件")
+        client.post("/api/box/mapping", json={"cell": 0, "device_id": dev["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        from pdl.api import _ctx
+        bridge = _ctx["bridge"]
+        conn = bridge._conn
+        original = conn.write_line
+        conn.write_line = lambda *a, **k: (_ for _ in ()).throw(OSError("x"))
+        try:
+            deadline = _time.time() + 8
+            while _time.time() < deadline:
+                if not client.get("/api/serial/status").get_json()["data"]["connected"]:
+                    break
+                _time.sleep(0.2)
+        finally:
+            conn.write_line = original                  # 重连前恢复通信能力
+        moves_before = client.get(
+            f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        r = client.post("/api/serial/connect", json={"port": "virtual://box"})
+        st = r.get_json()["data"]
+        assert st["connected"] is True
+        assert st["last_error"] is None                 # 重连后清除
+        # 重连不重复写流水
+        moves_after = client.get(
+            f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert len(moves_after) == len(moves_before)
+        client.post("/api/serial/disconnect")

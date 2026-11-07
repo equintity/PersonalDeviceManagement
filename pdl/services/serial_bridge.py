@@ -52,6 +52,8 @@ class VirtualBox:
         self._open = True
         self._pending_diff: list[dict] | None = None   # T5:待确认的库存差异
         self._stock_wait: dict | None = None           # T5:request_stock 聚合器
+        self._heartbeat: threading.Thread | None = None  # T7:5s ping 看门狗
+        self._last_pong: float = 0.0                     # T7:最近 pong 时刻
         self._last_error: str | None = None            # T7:断连原因
         self._last_seen: float | None = None           # T7:最近收到数据时刻
         self.last_ready_mapped: int | None = None      # T6:最近一次 ready.mapped
@@ -165,8 +167,12 @@ class SerialBridge:
         self._event_id = 0
         self._last_status: dict = {}
         self._lit_cell = -1
+        self._heartbeat: threading.Thread | None = None  # T7:5s ping 看门狗
+        self._last_pong: float = 0.0                     # T7:最近 pong 时刻
         self._pending_diff: list[dict] | None = None   # T5:待确认的库存差异
         self._stock_wait: dict | None = None           # T5:request_stock 聚合器
+        self._heartbeat: threading.Thread | None = None  # T7:5s ping 看门狗
+        self._last_pong: float = 0.0                     # T7:最近 pong 时刻
         self._last_error: str | None = None            # T7:断连原因
         self._last_seen: float | None = None           # T7:最近收到数据时刻
         self.last_ready_mapped: int | None = None      # T6:最近一次 ready.mapped
@@ -231,9 +237,16 @@ class SerialBridge:
 
             self._port = port
             self._stop.clear()
+            with self._lock:
+                self._last_error = None
+                self._last_seen = time.time()
+                self._last_pong = time.time()
             self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                             name="pdl-serial-reader")
             self._reader.start()
+            self._heartbeat = threading.Thread(target=self._heartbeat_loop,
+                                               daemon=True, name="pdl-heartbeat")
+            self._heartbeat.start()   # T7:5s ping 看门狗
             self._push_event("sys", {"msg": f"已连接 {port}"})
             self.send_command("info")            # 可不等回执
             # T5/QA-04:先读盒子差异,绝不先 push_sync(否则盒子真相被覆盖)
@@ -268,11 +281,41 @@ class SerialBridge:
                 self._push_event("sys", {"msg": "未获取到盒子库存状态,映射未自动同步,可手动同步"})
             return self.status()
 
+    def _heartbeat_loop(self) -> None:
+        """T7:每 5s ping,连续 15s 无 pong 判定断开(走统一清理路径)。"""
+        while not self._stop.is_set():
+            if self._stop.wait(5.0):
+                return
+            try:
+                if not self.send_command("ping"):
+                    self._teardown("心跳发送失败")
+                    return
+            except Exception as exc:  # 留痕而非静默
+                self._teardown(f"心跳发送异常:{exc}")
+                return
+            with self._lock:
+                last = self._last_pong
+            if time.time() - last > 15.0:
+                self._teardown("心跳超时(15s 无 pong)")
+                return
+
+    def _teardown(self, reason: str) -> None:
+        """T7:异常断连的统一清理 —— 状态真实化并广播原因。"""
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn = None
+            self._virtual = False
+            self._lit_cell = -1
+            self._last_error = reason
+        self._push_event("sys", {"msg": f"连接已断开:{reason}"})
+
     def disconnect(self) -> dict:
         with self._lock:
             conn, self._conn = self._conn, None
             self._port = None
             self._lit_cell = -1
+            self._last_error = "已主动断开" if conn is not None else self._last_error
             self._stop.set()
             if conn is not None:
                 try:
@@ -282,9 +325,11 @@ class SerialBridge:
                         conn.close()
                 except Exception:
                     pass
-            if self._port or conn is not None:
+            if conn is not None:
                 self._push_event("sys", {"msg": "已断开器件盒"})
-            return self.status()
+        if self._heartbeat and self._heartbeat.is_alive():
+            self._heartbeat.join(timeout=3)     # T7:心跳线程随连接生命周期
+        return self.status()
 
     @property
     def connected(self) -> bool:
@@ -442,21 +487,29 @@ class SerialBridge:
         if conn is None or self._virtual:
             return
         buf = b""
-        while not self._stop.is_set() and self._conn is not None:
-            try:
-                chunk = conn.read(256)
-            except Exception:
-                break
-            if not chunk:
-                time.sleep(0.05)
-                continue
-            buf += chunk
-            if len(buf) > MAX_LINE * 4:  # 异常保护:无换行的垃圾数据
-                buf = b""
-                continue
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                self._on_raw_line(line.decode("utf-8", "replace"))
+        try:
+            while not self._stop.is_set() and self._conn is not None:
+                try:
+                    chunk = conn.read(256)
+                except (OSError, ValueError) as exc:
+                    self._teardown(f"串口读取失败:{exc}")
+                    return
+                if not chunk:
+                    time.sleep(0.05)
+                    continue
+                with self._lock:
+                    self._last_seen = time.time()
+                buf += chunk
+                if len(buf) > MAX_LINE * 4:  # 异常保护:无换行的垃圾数据
+                    buf = b""
+                    continue
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    self._on_raw_line(line.decode("utf-8", "replace"))
+        finally:
+            # T7/QA-06:非主动断开 → 状态真实化(连接已断开 + 原因)
+            if not self._stop.is_set():
+                self._teardown("串口读取中断")
 
     def _on_raw_event(self, doc: dict) -> None:
         """虚拟盒事件入口(与真实硬件同一处理路径)。"""
@@ -489,6 +542,9 @@ class SerialBridge:
         self._push_event("in", {"evt": evt, **_clip(clean)})
         if evt == "ready":
             self.last_ready_mapped = doc.get("mapped")
+        if evt == "pong":
+            with self._lock:
+                self._last_pong = time.time()
         if evt == "stock" and self._stock_wait is not None:
             # T5:聚合分帧差异(仅投喂给等待中的 request_stock)
             for it in doc.get("items", []) or []:
