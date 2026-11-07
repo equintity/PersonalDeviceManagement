@@ -7,7 +7,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory
 
 from . import security
-from .db import db_path, get_db, init_db
+from .db import db_path, get_db, init_db, log_op
 from .paths import AppPaths, as_resources
 from .services import boxmap
 from .services.serial_bridge import SerialBridge
@@ -133,6 +133,11 @@ def create_app(project_root: str | Path | None = None, *,
 
     @app.errorhandler(security.ValidationError)
     def on_validation_error(exc):
+        try:
+            if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api"):
+                log_op(paths, "fail", request.path, str(exc), ok=False)
+        except Exception:  # 日志失败不影响错误响应
+            pass
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.errorhandler(404)
@@ -149,6 +154,11 @@ def create_app(project_root: str | Path | None = None, *,
     def on_error(exc):
         import traceback
         app.logger.error("未处理异常:%s\n%s", exc, traceback.format_exc())
+        try:
+            log_op(paths, "fail", request.path,
+                   f"{exc.__class__.__name__}: {exc}", ok=False)
+        except Exception:  # 日志失败不影响错误响应
+            pass
         return jsonify({"ok": False,
                         "error": f"服务器内部错误:{exc.__class__.__name__}"}), 500
 

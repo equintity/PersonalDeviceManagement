@@ -316,3 +316,48 @@ class TestReviveAfterDelete:
         assert resp.status_code == 201                # 复活而非报"已存在"
         d2 = resp.get_json()["data"]
         assert d2["id"] == d1["id"] and d2["name"] == "第二版" and d2["qty"] == 5
+
+
+class TestOpLogs:
+    """操作记录(统一审计):时间倒序、分类筛选、分页、失败记录。"""
+
+    def test_operations_logged_in_order(self, client):
+        d = device_create(client, "日志件")
+        client.post("/api/box/mapping", json={"cell": 0, "device_id": d["id"]})
+        client.post("/api/devices/batch-delete", json={"ids": [d["id"]]})
+        ops = client.get("/api/ops").get_json()["data"]
+        actions = [o["action"] for o in ops["items"]]
+        # 时间倒序(最新在前):删除 → 映射 → 创建
+        assert actions.index("device.delete") < actions.index("box.mapping") \
+            < actions.index("device.create")
+        assert ops["total"] >= 3
+
+    def test_filter_by_prefix(self, client):
+        device_create(client, "筛选件")
+        ops = client.get("/api/ops?action=device").get_json()["data"]
+        assert ops["items"] and all(o["action"].startswith("device")
+                                    for o in ops["items"])
+
+    def test_failure_recorded(self, client):
+        client.post("/api/devices", json={"name": ""})   # 触发校验失败
+        ops = client.get("/api/ops?action=fail").get_json()["data"]
+        assert ops["items"], "失败操作必须被记录"
+        assert all(o["ok"] == 0 for o in ops["items"])
+
+    def test_pagination(self, client):
+        for i in range(3):
+            device_create(client, f"分页件{i}")
+        r1 = client.get("/api/ops?page=1&page_size=2").get_json()["data"]
+        assert r1["page_size"] == 2 and len(r1["items"]) == 2
+        r2 = client.get("/api/ops?page=2&page_size=2").get_json()["data"]
+        assert len(r2["items"]) >= 1
+        assert r1["items"][0]["id"] > r2["items"][0]["id"]   # 倒序
+
+    def test_import_preview_not_logged(self, client, monkeypatch):
+        """只读/预览类接口不产生日志(仅变更操作入册)。"""
+        from pdl.services import prices as prices_mod
+        before = client.get("/api/ops").get_json()["data"]["total"]
+        monkeypatch.setattr(prices_mod, "fetch_lcsc_detail", lambda code: None)
+        client.post("/api/import/preview", json={"codes": ["C25704"]})
+        after = client.get("/api/ops").get_json()["data"]["total"]
+        assert after == before

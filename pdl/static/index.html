@@ -13,6 +13,7 @@
     <button data-tab="library" class="active">器件库</button>
     <button data-tab="box">器件盒映射</button>
     <button data-tab="codegen">代码生成</button>
+    <button data-tab="ops">操作记录</button>
   </nav>
   <div class="conn" id="connStatus">
     <span class="dot" id="connDot"></span><span id="connText">未连接器件盒</span>
@@ -179,7 +180,41 @@
       <pre id="codePreview" class="code">加载中…</pre>
     </div>
   </section>
+  <!-- ============ 操作记录 ============ -->
+  <section id="tab-ops" class="tab">
+    <div class="toolbar">
+      <select id="opsFilter" style="min-width:150px">
+        <option value="">全部操作</option>
+        <option value="device">器件操作</option>
+        <option value="stock">库存撤销</option>
+        <option value="import">导入</option>
+        <option value="box">器件盒</option>
+        <option value="price">价格刷新</option>
+        <option value="firmware">固件生成</option>
+        <option value="backup">备份恢复</option>
+        <option value="fail">失败记录</option>
+      </select>
+      <button id="opsRefresh">刷新</button>
+      <span class="spacer"></span>
+      <span class="muted" id="opsInfo"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th class="w150">时间 (UTC)</th><th class="w140">操作</th>
+          <th class="w180">对象</th><th>结果</th>
+        </tr></thead>
+        <tbody id="opsTbody"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span id="opsPageInfo" class="muted"></span>
+      <button id="opsPrev">‹ 上一页</button>
+      <button id="opsNext">下一页 ›</button>
+    </div>
+  </section>
 </main>
+
 
 <!-- 弹窗 -->
 <div id="modalMask" class="modal-mask hidden"><div class="modal" id="modalBox"></div></div>

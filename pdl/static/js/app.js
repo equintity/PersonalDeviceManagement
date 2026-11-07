@@ -80,6 +80,7 @@
       t.classList.toggle("active", t.id === `tab-${btn.dataset.tab}`);
     if (btn.dataset.tab === "codegen") loadPreview();
     if (btn.dataset.tab === "box") refreshPorts();
+    if (btn.dataset.tab === "ops") loadOps(1);
   });
 
   /* ================= 器件库 ================= */
@@ -885,6 +886,63 @@
     await refreshPorts();
     await pollEvents();
   })();
+
+  /* ================= 操作记录(统一审计入口) ================= */
+  const OPS_LABELS = {
+    "device.create": "新建器件", "device.update": "编辑器件",
+    "device.delete": "删除器件", "device.adjust": "调整库存",
+    "stock.undo": "撤销流水",
+    "import.files": "订单文件导入", "import.codes": "C编号导入",
+    "import.preview-save": "一键加载保存",
+    "box.config": "更新盒配置", "box.mapping": "设置映射",
+    "box.clear": "清空映射", "box.arrange": "一键排布",
+    "box.snapshot-restore": "恢复映射快照", "box.connect": "连接器件盒",
+    "box.disconnect": "断开器件盒", "box.light": "点亮/熄灭",
+    "price.refresh": "价格刷新", "firmware.generate": "生成固件",
+    "backup.restore": "恢复备份", "fail": "操作失败",
+  };
+  const opsState = { page: 1, size: 50, filter: "", total: 0 };
+
+  function opsLabel(action) {
+    if (action === "fail" || action.startsWith("fail ")) return "操作失败";
+    return OPS_LABELS[action] || action;
+  }
+
+  async function loadOps(page = 1) {
+    opsState.page = page;
+    const d = await api(`/ops?page=${page}&page_size=${opsState.size}` +
+      (opsState.filter ? `&action=${opsState.filter}` : ""));
+    opsState.total = d.total;
+    const tbody = $("opsTbody");
+    if (!d.items.length) {
+      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--fg-dim);padding:30px">
+        还没有任何操作记录 —— 创建器件、导入、映射、刷新价格后,这里会按时间记录每一步。</td></tr>`;
+    } else {
+      tbody.innerHTML = d.items.map((o) => `
+        <tr>
+          <td style="font-family:var(--mono);font-size:12px;white-space:nowrap">
+            ${esc(o.created_at.replace("T", " "))}</td>
+          <td>${opsState.filter === "fail" || o.action === "fail"
+            ? `<span class="p-badge discontinued">失败</span>`
+            : `<span class="p-badge ${o.ok ? "ok" : "discontinued"}">${o.ok ? "成功" : "失败"}</span>`}
+            <span style="margin-left:6px">${esc(opsLabel(o.action))}</span></td>
+          <td><span class="name" title="${esc(o.target)}">${esc(o.target || "—")}</span></td>
+          <td><span class="desc">${esc(o.detail || "—")}</span></td>
+        </tr>`).join("");
+    }
+    const pages = Math.max(1, Math.ceil(d.total / d.page_size));
+    $("opsPageInfo").textContent = `共 ${d.total} 条 · 第 ${d.page}/${pages} 页`;
+    $("opsPrev").disabled = d.page <= 1;
+    $("opsNext").disabled = d.page >= pages;
+  }
+
+  $("opsFilter").addEventListener("change", () => {
+    opsState.filter = $("opsFilter").value;
+    loadOps(1);
+  });
+  $("opsRefresh").addEventListener("click", () => loadOps(opsState.page));
+  $("opsPrev").addEventListener("click", () => loadOps(opsState.page - 1));
+  $("opsNext").addEventListener("click", () => loadOps(opsState.page + 1));
 
   /* ================= 桌面外壳集成 =================
    * 桌面模式由启动器以 ?shtoken=<随机令牌> 打开页面:

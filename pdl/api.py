@@ -17,7 +17,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 
 from . import APP_VERSION
 from . import security
-from .db import db_path, utc_now
+from .db import db_path, log_op, utc_now
 from .paths import as_data
 from .services import boxmap, codegen, devices as device_service, importer, prices
 from .services.serial_bridge import BridgeError, SerialBridge
@@ -59,6 +59,19 @@ def _int_arg(name: str, default: int) -> int:
 
 def _bridge() -> SerialBridge:
     return _ctx["bridge"]
+
+
+def _op(action: str, target: str = "", detail: str = "", ok: bool = True) -> None:
+    """写统一操作日志(时间/指令/对象/结果);日志失败绝不影响业务。"""
+    try:
+        log_op(_root(), action, target, detail, ok)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _op_fail(path: str, detail: str) -> None:
+    """失败操作:由应用工厂的全局错误处理器调用。"""
+    _op("fail", path, detail, ok=False)
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +139,16 @@ def devices_list():
 
 @bp.post("/devices")
 def devices_create():
-    return _ok(device_service.create_device(_root(), _body()), 201)
+    d = device_service.create_device(_root(), _body())
+    _op("device.create", d["name"], f"编号 {d['lcsc_code'] or '—'} · 库存 {d['qty']}")
+    return _ok(d, 201)
 
 
 @bp.put("/devices/<int:device_id>")
 def devices_update(device_id: int):
-    return _ok(device_service.update_device(_root(), device_id, _body()))
+    d = device_service.update_device(_root(), device_id, _body())
+    _op("device.update", d["name"], "编辑器件信息")
+    return _ok(d)
 
 
 @bp.get("/devices/<int:device_id>")
@@ -142,6 +159,7 @@ def devices_get(device_id: int):
 @bp.post("/devices/batch-delete")
 def devices_batch_delete():
     n = device_service.delete_devices(_root(), _body().get("ids"))
+    _op("device.delete", f"{n} 件", "软删除(数据保留,可经备份找回)")
     return _ok({"deleted": n})
 
 
@@ -150,7 +168,9 @@ def devices_adjust(device_id: int):
     body = _body()
     delta = security.validate_int(body.get("delta", 0), field="变动量",
                                   min_val=-1000, max_val=1000)
-    return _ok(device_service.adjust_qty(_root(), device_id, delta, source="manual"))
+    d = device_service.adjust_qty(_root(), device_id, delta, source="manual")
+    _op("device.adjust", d["name"], f"{delta:+d} → 结余 {d['qty']}")
+    return _ok(d)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +184,10 @@ def moves_list(device_id: int):
 
 @bp.post("/moves/<int:move_id>/undo")
 def moves_undo(move_id: int):
-    return _ok(device_service.undo_move(_root(), move_id))
+    r = device_service.undo_move(_root(), move_id)
+    _op("stock.undo", r["device"]["name"],
+        f"撤销流水#{move_id} → 结余 {r['device']['qty']}")
+    return _ok(r)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +204,10 @@ def snapshots_list():
 
 @bp.post("/snapshots/<int:snapshot_id>/restore")
 def snapshots_restore(snapshot_id: int):
-    return _ok(boxmap.restore_snapshot(_root(), snapshot_id))
+    r = boxmap.restore_snapshot(_root(), snapshot_id)
+    _op("box.snapshot-restore", f"快照#{snapshot_id}",
+        f"恢复 {r['restored']} 个格位映射")
+    return _ok(r)
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +360,22 @@ def import_files():
         total["errors"].extend(stats.get("errors", []))
     if total["imported"] + total["merged"] == 0 and not total["errors"]:
         raise security.ValidationError("所有文件都没有识别到有效数据")
+    _op("import.files", ", ".join(s["filename"] for s in saved)[:100],
+        f"新增 {total['imported']} / 合并 {total['merged']}"
+        + (f" · {len(total['errors'])} 个警告" if total["errors"] else ""))
     return _ok(total)
 
 
 @bp.post("/import/codes")
 def import_codes():
     body = _body()
-    return _ok(importer.import_codes(
+    r = importer.import_codes(
         _root(), body.get("codes"),
         fetch_details=security.validate_bool(body.get("fetch_details", True),
-                                             field="fetch_details")))
+                                             field="fetch_details"))
+    _op("import.codes", f"{len(body.get('codes') or [])} 个编号",
+        f"新增 {r['imported']} / 合并 {r['merged']}")
+    return _ok(r)
 
 
 @bp.post("/import/preview")
@@ -357,7 +389,10 @@ def import_preview():
 def import_save_preview():
     """C 编号一键加载·阶段二:保存用户确认/编辑后的预览行。"""
     body = _body()
-    return _ok(importer.save_preview(_root(), body.get("items")))
+    r = importer.save_preview(_root(), body.get("items"))
+    _op("import.preview-save", "C 编号一键加载",
+        f"新增 {r['created']} / 合并 {r['merged']} / 失败 {len(r['failed'])}")
+    return _ok(r)
 
 
 @bp.get("/import/logs")
@@ -385,28 +420,42 @@ def box_get():
 
 @bp.put("/box/config")
 def box_config():
-    return _ok(boxmap.update_config(_root(), _body()))
+    r = boxmap.update_config(_root(), _body())
+    _op("box.config", f"{r['rows']}×{r['cols']}",
+        "调整格栅尺寸"
+        + (f",移除越界映射 {len(r['removed_mappings'])} 条" if r.get("removed_mappings") else ""))
+    return _ok(r)
 
 
 @bp.post("/box/mapping")
 def box_set_mapping():
     body = _body()
-    return _ok(boxmap.set_mapping(_root(), body.get("cell"), body.get("device_id")))
+    r = boxmap.set_mapping(_root(), body.get("cell"), body.get("device_id"))
+    _op("box.mapping", f"格位 {body.get('cell')}",
+        f"→ {r['device']['name']}" if r.get("device") else "解除映射")
+    return _ok(r)
 
 
 @bp.delete("/box/mapping/<int:cell>")
 def box_clear_mapping(cell: int):
-    return _ok(boxmap.set_mapping(_root(), cell, None))
+    r = boxmap.set_mapping(_root(), cell, None)
+    _op("box.mapping", f"格位 {cell}", "解除映射")
+    return _ok(r)
 
 
 @bp.post("/box/clear")
 def box_clear():
-    return _ok({"cleared": boxmap.clear_box(_root())})
+    n = boxmap.clear_box(_root())
+    _op("box.clear", f"{n} 格", "清空映射(已生成快照,可撤销)")
+    return _ok({"cleared": n})
 
 
 @bp.post("/box/auto-arrange")
 def box_auto_arrange():
-    return _ok(boxmap.auto_arrange(_root()))
+    r = boxmap.auto_arrange(_root())
+    _op("box.arrange", f"{r['assigned']} 件",
+        f"一键排布(盒 {r['cells']} 格,已生成快照,可撤销)")
+    return _ok(r)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +470,7 @@ def codegen_preview():
 def codegen_generate():
     body = _body()
     result = codegen.generate(_root(), body.get("output_dir", ""))
+    _op("firmware.generate", result["output_dir"], f"生成 {result['count']} 个文件")
     return _ok(result)
 
 
@@ -436,8 +486,36 @@ def prices_refresh():
     scope = body.get("scope", "selected" if ids else "all")
     if not isinstance(scope, str):
         raise security.ValidationError("scope 必须是字符串")
-    return _ok(prices.refresh_prices(_root(), ids=ids,
-                                     scope=scope.lower() if scope else "all"))
+    r = prices.refresh_prices(_root(), ids=ids,
+                              scope=scope.lower() if scope else "all")
+    _op("price.refresh", r["scope"],
+        f"更新 {len(r['updated'])} / 无匹配 {len(r['no_match'])}"
+        f" / 下架 {len(r['discontinued'])} / 失败 {len(r['failed'])}")
+    return _ok(r)
+
+
+# ---------------------------------------------------------------------------
+# 操作记录(统一审计入口;顺带关闭 D-11 导入历史无界面)
+# ---------------------------------------------------------------------------
+@bp.get("/ops")
+def ops_list():
+    """操作记录:时间倒序 + 分页 + 按指令类别前缀筛选。"""
+    page = _int_arg("page", 1)
+    page_size = _int_arg("page_size", 50)
+    action = (request.args.get("action", "") or "").strip()
+    where, params = ["1=1"], []
+    if action:
+        where.append("(action LIKE ? OR action = ?)")
+        params.extend([action + ".%", action])
+    clause = " AND ".join(where)
+    conn = _ctx["get_db"]()
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM op_logs WHERE {clause}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM op_logs WHERE {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+        [*params, page_size, (page - 1) * page_size]).fetchall()
+    return _ok({"total": total, "page": page, "page_size": page_size,
+                "items": [dict(r) for r in rows]})
 
 
 # ---------------------------------------------------------------------------
@@ -452,16 +530,21 @@ def serial_ports():
 def serial_connect():
     body = _body()
     try:
-        return _ok(_bridge().connect(body.get("port", ""),
-                                     body.get("baud", 115200) if isinstance(
-                                         body.get("baud", 115200), int) else 115200))
+        st = _bridge().connect(body.get("port", ""),
+                               body.get("baud", 115200) if isinstance(
+                                   body.get("baud", 115200), int) else 115200)
+        _op("box.connect", st.get("port") or body.get("port", ""), "连接成功,映射已同步")
+        return _ok(st)
     except BridgeError as exc:
+        _op("box.connect", body.get("port", ""), f"连接失败:{exc}", ok=False)
         return _fail(str(exc), 409)
 
 
 @bp.post("/serial/disconnect")
 def serial_disconnect():
-    return _ok(_bridge().disconnect())
+    st = _bridge().disconnect()
+    _op("box.disconnect", st.get("port") or "", "断开器件盒")
+    return _ok(st)
 
 
 @bp.get("/serial/status")
@@ -492,7 +575,9 @@ def serial_light():
     on = security.validate_bool(body.get("on", True), field="on")
     if not _bridge().connected:
         return _fail("器件盒未连接", 409)
-    return _ok({"sent": _bridge().light_cell(cell, on)})
+    r = _bridge().light_cell(cell, on)
+    _op("box.light", f"格位 {cell}", "点亮" if on else "熄灭")
+    return _ok({"sent": r})
 
 
 @bp.post("/serial/simulate")

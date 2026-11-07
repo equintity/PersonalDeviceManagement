@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at   TEXT NOT NULL
 );
 
+-- 统一操作日志:时间/指令/对象/结果(界面「操作记录」页数据源)
+CREATE TABLE IF NOT EXISTS op_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    action     TEXT NOT NULL,      -- 指令:device.create / box.clear / import.files …
+    target     TEXT NOT NULL DEFAULT '',
+    detail     TEXT NOT NULL DEFAULT '',
+    ok         INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_ops_id ON op_logs(id);
+
 -- T-M2-01:导入批次幂等登记(同一文件默认不重复入库)
 CREATE TABLE IF NOT EXISTS import_batches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +184,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 # 备份(T-M1-04):基于 sqlite backup API 的一致性快照
 # ---------------------------------------------------------------------------
+def log_op(root, action: str, target: str = "", detail: str = "",
+           ok: bool = True) -> None:
+    """写一条操作日志。日志失败绝不影响业务操作本身;超过 2 万条时裁剪至 1.5 万。"""
+    try:
+        conn = get_db(root)
+        conn.execute(
+            "INSERT INTO op_logs (created_at, action, target, detail, ok)"
+            " VALUES (?,?,?,?,?)",
+            (utc_now(), action[:60], (target or "")[:120],
+             (detail or "")[:500], 1 if ok else 0))
+        if conn.execute("SELECT COUNT(*) FROM op_logs").fetchone()[0] > 20000:
+            conn.execute(
+                "DELETE FROM op_logs WHERE id NOT IN"
+                " (SELECT id FROM op_logs ORDER BY id DESC LIMIT 15000)")
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
 def backup_db(root, dest: Path) -> Path:
     """把当前数据库做一致性快照到 dest(在线备份,不阻塞写入)。"""
     src = get_db(root)
