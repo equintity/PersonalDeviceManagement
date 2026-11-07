@@ -36,7 +36,24 @@
     el.className = `toast ${cls}`;
     el.textContent = msg;
     $("toasts").appendChild(el);
+    // 完成反馈至少完整停留 1.5s(总驻留 3.4s)后才开始淡出
+    setTimeout(() => el.classList.add("out"), 3400);
     setTimeout(() => el.remove(), 3800);
+  }
+
+  /* 完成态闪烁:格位高亮保持 hold 毫秒(≥1.5s)后才回退,
+     确保"操作 → 反馈"因果可感知。
+     flashMap 登记未过期的闪烁,防止轮询重渲染把完成态提前抹掉。 */
+  const flashMap = new Map();
+  function flashCell(cell, cls = "flash-ok", hold = 1600) {
+    const until = Date.now() + hold;
+    flashMap.set(cell, { cls, until });
+    const el = document.querySelector(`#grid .cell[data-cell="${cell}"]`);
+    if (el) el.classList.add(cls);
+    setTimeout(() => {
+      flashMap.delete(cell);
+      document.querySelector(`#grid .cell[data-cell="${cell}"]`)?.classList.remove(cls);
+    }, hold);
   }
   const ticker = (msg) => { $("eventTicker").textContent =
     `[${new Date().toLocaleTimeString()}] ${msg}`; };
@@ -370,11 +387,14 @@
     const grid = $("grid");
     grid.style.setProperty("--cols", config.cols);
     let html = "";
+    const now = Date.now();
     for (let i = 0; i < config.cells; i++) {
       const m = map[i];
       const lit = i === state.status.lit_cell ? " lit" : "";
       const sel = i === state.selectedCell ? " selected" : "";
-      html += `<div class="cell${m ? "" : " empty"}${sel}${lit}" data-cell="${i}"
+      const fl = flashMap.get(i);
+      const flash = fl && fl.until > now ? ` ${fl.cls}` : "";
+      html += `<div class="cell${m ? "" : " empty"}${sel}${lit}${flash}" data-cell="${i}"
         title="行 ${Math.floor(i / config.cols) + 1} 列 ${i % config.cols + 1}">
         <span class="num">${i}</span>
         <div class="nm">${m ? esc(m.device.name) : "(空)"}</div>
@@ -497,9 +517,12 @@
     $("pickList").addEventListener("click", async (e) => {
       const item = e.target.closest(".picker-item");
       if (!item?.dataset.id) return;
-      await api("/box/mapping", { json: { cell: state.selectedCell, device_id: Number(item.dataset.id) } });
-      toast(`已映射到格位 #${state.selectedCell}`, "ok");
-      closeModal(); loadBox();
+      const cell = state.selectedCell;
+      await api("/box/mapping", { json: { cell, device_id: Number(item.dataset.id) } });
+      toast(`已映射到格位 #${cell}`, "ok");
+      closeModal();
+      await loadBox();
+      flashCell(cell, "flash-ok");   // 分配完成态停留 ≥1.5s
     });
   });
 
@@ -507,19 +530,20 @@
     if (state.selectedCell < 0) return;
     await api(`/box/mapping/${state.selectedCell}`, { method: "DELETE" });
     toast("已解除映射", "ok");
-    loadBox();
+    await loadBox();
+    flashCell(state.selectedCell, "flash-err");   // 解除=橙红闪烁 ≥1.5s
   });
   $("btnLightCell").addEventListener("click", async () => {
     if (state.selectedCell < 0) return;
     state.cellLit = !state.cellLit;
     try {
       await api("/serial/light", { json: { cell: state.selectedCell, on: state.cellLit } });
-      if (!state.cellLit) ticker("已熄灭指示灯");
+      toast(state.cellLit ? "已点亮格位(硬件同步)" : "已熄灭", "ok");
     } catch (err) {
       state.cellLit = false;
       toast(err.message, "warn");
     }
-    loadBox();
+    await loadBox();
   });
   $("btnTakeCell").addEventListener("click", async () => {
     const m = currentCellMapping();
@@ -527,7 +551,8 @@
     await api(`/devices/${m.device.id}/adjust-qty`, { json: { delta: -1 } });
     try { await api("/serial/light", { json: { cell: state.selectedCell, on: true } }); } catch {}
     toast(`取料 −1:${m.device.name}`, "ok");
-    loadBox();
+    await loadBox();
+    flashCell(state.selectedCell, "flash-ok");    // 完成态停留 ≥1.5s
   });
 
   /* ================= 串口联动 ================= */
@@ -584,7 +609,8 @@
         if (ev.dir === "in") {
           if (data.evt === "take" || data.evt === "return") {
             toast(`${data.evt === "take" ? "取料" : "退料"}联动:格位 #${data.cell}`, "ok");
-            loadBox();
+            await loadBox();
+            flashCell(data.cell, "flash-ok");   // 硬件动作的可见回执 ≥1.5s
           } else if (data.evt === "lit") {
             if (state.status.lit_cell >= 0 || data.cell >= 0) loadBox();
           } else if (data.evt === "hello") {
@@ -623,12 +649,18 @@
          <div class="muted" style="margin-top:6px">${r.files.map(esc).join(" · ")}</div>
          <div class="muted" style="margin-top:6px">下一步:用 VSCode + PlatformIO 打开该目录,点击 Upload 烧录。</div>`;
       toast("固件工程生成完成", "ok");
+      // 完成态驻留按钮 ≥1.5s,再恢复可点击
+      btn.textContent = "✔ 已生成";
+      setTimeout(() => {
+        btn.textContent = "⚙ 生成固件工程";
+        btn.disabled = false;
+      }, 1600);
       loadPreview();
     } catch (err) {
       $("genResult").innerHTML = `<div class="err">✘ ${esc(err.message)}</div>`;
       toast(`生成失败:${err.message}`, "err");
+      btn.disabled = false; btn.textContent = "⚙ 生成固件工程";
     }
-    btn.disabled = false; btn.textContent = "⚙ 生成固件工程";
   });
 
   /* ================= 初始化 ================= */
