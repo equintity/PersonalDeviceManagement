@@ -218,7 +218,27 @@ tbody tr:active { background: #d7e6d3; }
 @keyframes modalin { from { opacity: 0; transform: translateY(-14px) scale(.98); } }
 .modal h3 { margin: 0 0 12px; color: var(--pri-d); font-size: 15px; }
 .modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+.modal.wide { width: 940px; max-width: 96vw; }
 .modal textarea { min-height: 90px; font-family: var(--mono); font-size: 12px; }
+/* 一键加载预览表:行内编辑,悬停显边、聚焦显底,因果清晰 */
+.pv-wrap { max-height: 46vh; overflow: auto; border: 1px solid var(--line);
+  border-radius: 8px; margin-top: 8px; }
+.pv-table { border-collapse: collapse; width: 100%; min-width: 700px; }
+.pv-table th { font-size: 11px; padding: 6px 8px; background: var(--bg3); }
+.pv-table td { padding: 3px 6px; border-bottom: 1px solid var(--line); }
+.pv-table tr:hover td { background: var(--pri-t); }
+.pv-input { border: 1px solid transparent; background: transparent;
+  color: var(--ink); border-radius: 5px; padding: 4px 6px; width: 100%;
+  min-width: 70px; font-size: 12px;
+  transition: border-color var(--t-fast), background var(--t-fast), box-shadow var(--t-fast); }
+.pv-input:hover { border-color: var(--line); }
+.pv-input:focus { outline: none; background: #fff; border-color: var(--pri);
+  box-shadow: 0 0 0 2px rgba(47, 107, 70, .15); }
+.pv-input:disabled { color: var(--fg-dim); }
+.pv-off td { background: #f3efe2; }
+.pv-del { border: none; background: transparent; color: var(--fg-dim);
+  cursor: pointer; font-size: 13px; padding: 2px 6px; border-radius: 6px; }
+.pv-del:hover { color: #fff; background: var(--accent); }
 .picker-list { max-height: 300px; overflow: auto; margin-top: 8px;
   border: 1px solid var(--line); border-radius: 8px; }
 .picker-item { padding: 8px 12px; border-bottom: 1px solid var(--line);

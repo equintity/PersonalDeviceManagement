@@ -222,6 +222,20 @@ def import_codes():
                                              field="fetch_details")))
 
 
+@bp.post("/import/preview")
+def import_preview():
+    """C 编号一键加载·阶段一:校验 + 按接口补全属性,返回可编辑预览。"""
+    body = _body()
+    return _ok(importer.preview_codes(_root(), body.get("codes")))
+
+
+@bp.post("/import/save-preview")
+def import_save_preview():
+    """C 编号一键加载·阶段二:保存用户确认/编辑后的预览行。"""
+    body = _body()
+    return _ok(importer.save_preview(_root(), body.get("items")))
+
+
 @bp.get("/import/logs")
 def import_logs():
     rows = _ctx["get_db"]().execute(

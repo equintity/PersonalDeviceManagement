@@ -25,6 +25,7 @@ from pathlib import Path
 from .. import security
 from ..db import get_db, utc_now
 from . import devices as device_service
+from . import prices as price_service
 
 # 立创商城公开商品详情接口(可用环境变量 PDL_LCSC_API 覆盖)
 LCSC_API_URL = "https://wmsc.lcsc.com/ftps/wm/product/detail"
@@ -398,3 +399,164 @@ def import_csv(project_root, file_items: list[dict]) -> dict:
     )
     conn.commit()
     return {"imported": imported, "merged": merged, "skipped": 0, "errors": []}
+
+
+# ---------------------------------------------------------------------------
+# 途径 4:C 编号一键加载(预览-编辑-确认 两阶段导入)
+# ---------------------------------------------------------------------------
+PREVIEW_MAX_CODES = 50      # 单次预览请求上限(前端分块调用)
+SAVE_MAX_ITEMS = 200        # 单次确认保存上限
+
+def preview_codes(project_root, codes) -> dict:
+    """阶段一:校验 C 编号并按接口补全属性,返回可编辑预览列表。
+
+    每行状态:
+    - invalid  格式无效(C+数字规则不通过)
+    - not_found 接口无返回(编号可能不存在或网络异常)
+    - exists   库中已有同编号器件(保存时仅合并数量并刷新价格,人工字段不覆盖)
+    - new      新器件(字段已按接口补全,可编辑)
+    重复编号在输入内自动去重(保留首个)。
+    """
+    if not isinstance(codes, list) or not codes:
+        raise security.ValidationError("请提供 C 编号列表")
+    if len(codes) > PREVIEW_MAX_CODES:
+        raise security.ValidationError(f"单次预览最多 {PREVIEW_MAX_CODES} 个编号")
+
+    ordered: list[str] = []
+    seen = set()
+    invalid_rows: list[dict] = []
+    for raw in codes:
+        text = str(raw).strip()
+        code = None
+        if text:
+            try:
+                code = security.validate_lcsc_code(text)
+            except security.ValidationError:
+                code = None
+        if not code:
+            invalid_rows.append({"input": security.sanitize_text(text, max_len=20),
+                                 "status": "invalid",
+                                 "reason": "编号格式无效(应为 C+数字)"})
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        ordered.append(code)
+
+    conn = get_db(project_root)
+    items: list[dict] = []
+    for code in ordered:
+        info = price_service.fetch_lcsc_detail(code)
+        if info is None:
+            items.append({"code": code, "status": "not_found",
+                          "reason": "接口无返回:编号可能不存在,或网络/限流异常"})
+            continue
+        row = conn.execute(
+            "SELECT qty FROM devices WHERE lcsc_code = ?", (code,)).fetchone()
+        items.append({
+            "code": code,
+            "status": "exists" if row else "new",
+            "exists_qty": row["qty"] if row else None,
+            "cycle": info["cycle"],
+            "name": info["name"] or code,
+            "model": info["model"],
+            "package": info["package"],
+            "manufacturer": info["brand"],
+            "category": info["category"],
+            "description": info["description"],
+            "price": info["price"],
+            "price_currency": info["currency"] or "USD",
+            "qty": min(info["stock"], security.MAX_QTY) if info["stock"] > 0 else 1,
+        })
+        time.sleep(price_service.REQUEST_INTERVAL)
+    return {"items": items, "invalid": invalid_rows}
+
+
+def save_preview(project_root, items) -> dict:
+    """阶段二:保存用户确认(且可能编辑过)的预览行。
+
+    - new 行:全字段入库(再次过白名单/数值校验,不信任客户端);
+    - exists 行:仅合并数量并刷新价格/状态,人工字段不覆盖(与预览提示一致);
+    - 已下架(cycle != normal)行:价格状态标记 discontinued。
+    """
+    if not isinstance(items, list) or not items:
+        raise security.ValidationError("没有要保存的器件")
+    if len(items) > SAVE_MAX_ITEMS:
+        raise security.ValidationError(f"单次保存最多 {SAVE_MAX_ITEMS} 件")
+
+    conn = get_db(project_root)
+    created = merged = 0
+    failed: list[dict] = []
+    now = utc_now()
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise security.ValidationError("预览数据格式错误")
+        try:
+            code = security.validate_lcsc_code(str(raw.get("code") or ""))
+        except security.ValidationError as exc:
+            failed.append({"code": str(raw.get("code"))[:20], "error": str(exc)})
+            continue
+        if not code:
+            failed.append({"code": str(raw.get("code"))[:20], "error": "编号缺失或无效"})
+            continue
+        try:
+            qty = security.validate_int(
+                int(re.search(r"\d{1,7}", str(raw.get("qty") or "1")).group(0))
+                if re.search(r"\d{1,7}", str(raw.get("qty") or "1")) else 1,
+                field="库存数量", min_val=0, max_val=security.MAX_QTY)
+            fields = {
+                "name": security.sanitize_text(raw.get("name") or code,
+                                               field="器件名",
+                                               max_len=security.MAX_NAME_LEN) or code,
+                "model": security.validate_model(raw.get("model")),
+                "package": security.sanitize_text(raw.get("package"), max_len=30),
+                "manufacturer": security.sanitize_text(raw.get("manufacturer"), max_len=60),
+                "category": security.sanitize_text(raw.get("category"), max_len=40),
+                "description": security.sanitize_text(raw.get("description"), max_len=security.MAX_TEXT_LEN),
+            }
+            price = raw.get("price")
+            price = round(float(price), 6) if isinstance(price, (int, float)) \
+                and not isinstance(price, bool) and 0 <= float(price) <= 1e7 else None
+        except security.ValidationError as exc:
+            failed.append({"code": code, "error": str(exc)})
+            continue
+        except (TypeError, ValueError):
+            failed.append({"code": code, "error": "数值字段格式错误"})
+            continue
+
+        cycle = security.sanitize_text(raw.get("cycle") or "normal", max_len=20)
+        row = conn.execute("SELECT id, qty FROM devices WHERE lcsc_code = ?",
+                           (code,)).fetchone()
+        if row:  # 已存在:合并数量 + 刷新价格状态(人工字段不覆盖)
+            conn.execute(
+                "UPDATE devices SET qty = MIN(?, qty + ?),"
+                " price = ?, price_currency = ?,"
+                " price_status = ?, price_source = 'lcsc', price_updated_at = ?,"
+                " updated_at = ? WHERE id = ?",
+                (security.MAX_QTY, qty, price,
+                 security.sanitize_text(raw.get("price_currency") or "USD", max_len=6),
+                 "discontinued" if cycle != "normal" else
+                 ("ok" if price is not None else "no_match"),
+                 now, now, row["id"]))
+            merged += 1
+        else:
+            status_value = ("discontinued" if cycle != "normal"
+                            else ("ok" if price is not None else "no_match"))
+            # 17 列 = 14 占位符 + 3 字面量(price_source='lcsc', attrs='{}', source='lcsc')
+            conn.execute(
+                "INSERT INTO devices (lcsc_code, model, name, category, package,"
+                " manufacturer, description, qty, price, price_currency, price_status,"
+                " price_source, price_updated_at, attrs, source, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?, 'lcsc', ?, '{}', 'lcsc', ?, ?)",
+                (code, fields["model"], fields["name"], fields["category"],
+                 fields["package"], fields["manufacturer"], fields["description"],
+                 qty, price,
+                 security.sanitize_text(raw.get("price_currency") or "USD", max_len=6),
+                 status_value, now, now, now))
+            created += 1
+    conn.execute(
+        "INSERT INTO import_logs (kind, detail, imported, merged, skipped, errors, created_at)"
+        " VALUES ('preview', 'C编号一键加载', ?, ?, ?, '[]', ?)",
+        (created, merged, len(failed), now))
+    conn.commit()
+    return {"created": created, "merged": merged, "failed": failed}

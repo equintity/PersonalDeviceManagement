@@ -271,47 +271,181 @@
   $("btnImport").addEventListener("click", () => {
     const m = openModal(`
       <h3>从立创商城批量导入</h3>
-      <h4>方式一:订单文件(.xlsx / .xls / .csv,可多选)</h4>
-      <input type="file" id="impFiles" multiple accept=".xlsx,.xls,.csv">
-      <label class="muted" style="margin-top:4px">
-        <input type="checkbox" id="impFetchFiles" checked style="width:auto">
-        自动联网补充器件详情(名称/封装/品牌)</label>
-      <h4 style="margin-top:14px">方式二:C 编号批量导入(每行一个,如 C25704)</h4>
-      <textarea id="impCodes" placeholder="C25704&#10;C81588&#10;C31250"></textarea>
-      <label class="muted" style="margin-top:4px">
-        <input type="checkbox" id="impFetchCodes" checked style="width:auto">
-        自动联网补充器件详情</label>
-      <div class="actions">
-        <button id="impCancel">取消</button>
-        <button id="impGo" class="primary">开始导入</button>
+      <div id="impEntry">
+        <h4>方式一:订单文件(.xlsx / .xls / .csv,可多选)</h4>
+        <input type="file" id="impFiles" multiple accept=".xlsx,.xls,.csv">
+        <label class="muted" style="margin-top:4px">
+          <input type="checkbox" id="impFetchFiles" checked style="width:auto">
+          自动联网补充器件详情(名称/封装/品牌)</label>
+        <div class="actions">
+          <button id="impCancel">取消</button>
+          <button id="impGo" class="primary">导入文件</button>
+        </div>
+        <h4 style="margin-top:16px">方式二:C 编号一键加载(推荐)</h4>
+        <p class="muted" style="margin:4px 0">手动录入或批量粘贴 C 编号(每行一个),
+          系统自动补全名称/型号/封装/品牌/价格/库存,可在保存前逐项修改。</p>
+        <textarea id="impCodes" placeholder="C25704&#10;C2040&#10;C8734"></textarea>
+        <div id="impProgress" class="muted" style="margin-top:6px"></div>
+        <div class="actions">
+          <button id="impCancel2">取消</button>
+          <button id="impLoad" class="primary">🚀 一键加载</button>
+        </div>
       </div>
-      <p class="muted">重复器件自动合并并累加数量;没有详情时仍会按 C 编号入库。</p>`);
+      <div id="impPreviewWrap" class="hidden"></div>`);
+    m.classList.add("wide");
     m.querySelector("#impCancel").addEventListener("click", closeModal);
+    m.querySelector("#impCancel2").addEventListener("click", closeModal);
+
+    // ---- 方式一:文件导入 ----
     m.querySelector("#impGo").addEventListener("click", async () => {
       const btn = m.querySelector("#impGo");
+      const files = m.querySelector("#impFiles").files;
+      if (!files.length) return toast("请选择订单文件", "warn");
       btn.disabled = true; btn.textContent = "导入中…";
       try {
-        const files = m.querySelector("#impFiles").files;
-        const codes = m.querySelector("#impCodes").value;
-        let last = null;
-        if (files.length) {
-          const fd = new FormData();
-          for (const f of files) fd.append("files", f);
-          fd.append("fetch_details", m.querySelector("#impFetchFiles").checked ? "1" : "0");
-          last = await api("/import/files", { method: "POST", form: fd });
-        }
-        if (codes.trim()) {
-          last = await api("/import/codes", { json: {
-            codes: codes.split(/[\s,;、]+/).filter(Boolean),
-            fetch_details: m.querySelector("#impFetchCodes").checked } });
-        }
-        if (!last) { toast("请选择文件或输入 C 编号", "warn"); btn.disabled = false; btn.textContent = "开始导入"; return; }
-        const msgs = [`新增 ${last.imported} 件,合并 ${last.merged} 件`];
-        if (last.errors?.length) msgs.push(`警告:${last.errors.join(";")}`);
-        toast(msgs.join("。"), last.errors?.length ? "warn" : "ok");
+        const fd = new FormData();
+        for (const f of files) fd.append("files", f);
+        fd.append("fetch_details",
+          m.querySelector("#impFetchFiles").checked ? "1" : "0");
+        const r = await api("/import/files", { method: "POST", form: fd });
+        const msgs = [`新增 ${r.imported} 件,合并 ${r.merged} 件`];
+        if (r.errors?.length) msgs.push(`警告:${r.errors.join(";")}`);
+        toast(msgs.join("。"), r.errors?.length ? "warn" : "ok");
         closeModal(); loadDevices(); loadBox();
       } catch (err) { toast(`导入失败:${err.message}`, "err"); }
-      btn.disabled = false; btn.textContent = "开始导入";
+      btn.disabled = false; btn.textContent = "导入文件";
+    });
+
+    // ---- 方式二:C 编号一键加载(预览-编辑-确认) ----
+    const wrap = m.querySelector("#impPreviewWrap");
+    const entry = m.querySelector("#impEntry");
+    const prog = m.querySelector("#impProgress");
+    let rows = [];          // 预览行状态(含用户编辑)
+    let invalids = [];      // 格式无效行
+
+    const esc2 = esc;
+    const statusChip = (s) => ({
+      new: '<span class="p-badge ok">新器件</span>',
+      exists: '<span class="p-badge" style="color:var(--pri-d);border-color:var(--pri)">已存在·合并</span>',
+      not_found: '<span class="p-badge no_match">无返回</span>',
+      invalid: '<span class="p-badge error">格式无效</span>',
+    }[s] || "");
+
+    function renderEntry() {
+      wrap.classList.add("hidden");
+      entry.classList.remove("hidden");
+      m.querySelector("#impLoad").disabled = false;
+      m.querySelector("#impLoad").textContent = "🚀 一键加载";
+    }
+
+    function renderPreview() {
+      entry.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      const editable = (idx, field, val, disabled) =>
+        `<input class="pv-input" data-idx="${idx}" data-field="${field}"
+          value="${esc2(val ?? "")}" ${disabled ? "disabled" : ""}>`;
+      const body = rows.map((r, idx) => {
+        const locked = r.status === "exists";   // 已存在:人工字段不覆盖,锁定编辑
+        const off = r.status !== "new" && r.status !== "exists";
+        return `<tr class="${off ? "pv-off" : ""}">
+          <td><span class="code-chip">${esc2(r.code)}</span>${statusChip(r.status)}
+            ${r.status === "exists" ? `<div class="muted" style="font-size:10px">库内 ${r.exists_qty} 件,保存时合并</div>` : ""}
+            ${r.cycle && r.cycle !== "normal" ? '<div class="muted" style="font-size:10px;color:var(--err)">已下架</div>' : ""}</td>
+          <td>${editable(idx, "name", r.name, off)}</td>
+          <td>${editable(idx, "model", r.model, off)}</td>
+          <td>${editable(idx, "package", r.package, off)}</td>
+          <td>${editable(idx, "manufacturer", r.manufacturer, off)}</td>
+          <td>${off ? "—" : editable(idx, "price", r.price ?? "", false)}</td>
+          <td>${off ? "—" : editable(idx, "qty", r.qty, false)}</td>
+          <td><button class="pv-del" data-idx="${idx}" title="移除此行">✕</button></td></tr>`;
+      }).join("");
+      const invalidHtml = invalids.length
+        ? `<div class="sum-sec"><h4 style="color:var(--err)">无效编号(${invalids.length})</h4>
+           <ul class="sum-list">${invalids.map((v) =>
+             `<li><span class="code-chip">${esc2(v.input || "(空)")}</span> —— ${esc2(v.reason)}</li>`).join("")}</ul></div>`
+        : "";
+      const savable = rows.filter((r) => r.status === "new" || r.status === "exists").length;
+      wrap.innerHTML = `
+        <h4>加载结果预览(可编辑,保存前请核对)</h4>
+        ${invalidHtml}
+        <div class="pv-wrap"><table class="pv-table"><thead><tr>
+          <th>C编号</th><th>名称</th><th>型号</th><th>封装</th>
+          <th>品牌</th><th>价格$</th><th>库存</th><th></th>
+        </tr></thead><tbody>${body || ""}</tbody></table></div>
+        <p class="muted">已存在器件保存时仅合并数量并刷新价格,人工字段不会覆盖(输入框已锁定)。
+          价格为立创接口 USD 价。</p>
+        <div class="actions">
+          <button id="impBack">⬅ 返回修改编号</button>
+          <button id="impSave" class="primary" ${savable ? "" : "disabled"}>
+            ✔ 确认保存(${savable} 件)</button>
+        </div>`;
+      // 编辑绑定:输入即写回 rows(保存前可自由修改)
+      wrap.querySelectorAll(".pv-input").forEach((inp) => {
+        inp.addEventListener("input", () => {
+          const idx = Number(inp.dataset.idx);
+          const field = inp.dataset.field;
+          let v = inp.value;
+          if (field === "price" || field === "qty") v = v.replace(/[^\d.]/g, "");
+          rows[idx][field] = v;
+        });
+      });
+      wrap.querySelectorAll(".pv-del").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          rows.splice(Number(btn.dataset.idx), 1);
+          renderPreview();
+        });
+      });
+      wrap.querySelector("#impBack").addEventListener("click", renderEntry);
+      wrap.querySelector("#impSave").addEventListener("click", async () => {
+        const btn = wrap.querySelector("#impSave");
+        const items = rows
+          .filter((r) => r.status === "new" || r.status === "exists")
+          .map((r) => ({ ...r, qty: Number(r.qty) || 0,
+                         price: r.price === "" || r.price === null ? null : Number(r.price) }));
+        if (!items.length) return;
+        btn.disabled = true; btn.textContent = "保存中…";
+        try {
+          const r = await api("/import/save-preview", { json: { items } });
+          toast(`已保存:新增 ${r.created} 件,合并 ${r.merged} 件` +
+                (r.failed.length ? `,失败 ${r.failed.length} 件` : ""),
+                r.failed.length ? "warn" : "ok");
+          closeModal(); loadDevices(); loadBox();
+        } catch (err) {
+          toast(`保存失败:${err.message}`, "err");
+          btn.disabled = false; btn.textContent = "✔ 确认保存";
+        }
+      });
+    }
+
+    m.querySelector("#impLoad").addEventListener("click", async () => {
+      const btn = m.querySelector("#impLoad");
+      const codes = m.querySelector("#impCodes").value
+        .split(/[\s,;、]+/).filter(Boolean);
+      if (!codes.length) return toast("请先录入或粘贴 C 编号", "warn");
+      btn.disabled = true; btn.textContent = "加载中…";
+      rows = []; invalids = [];
+      entry.querySelector("#impCodes").disabled = true;
+      // 分块请求(每块 20 个),进度可见;后端再限速 0.35s/个
+      const CHUNK = 20;
+      try {
+        for (let i = 0; i < codes.length; i += CHUNK) {
+          const chunk = codes.slice(i, i + CHUNK);
+          prog.textContent = `加载中 ${Math.min(i + CHUNK, codes.length)}/${codes.length} …(含接口限速)`;
+          const r = await api("/import/preview", { json: { codes: chunk } });
+          rows = rows.concat(r.items);
+          invalids = invalids.concat(r.invalid);
+        }
+        prog.textContent = "";
+        if (!rows.length && !invalids.length) {
+          toast("没有识别到有效编号", "warn");
+        } else {
+          renderPreview();
+        }
+      } catch (err) {
+        toast(`加载失败:${err.message}`, "err");
+      }
+      entry.querySelector("#impCodes").disabled = false;
+      btn.disabled = false; btn.textContent = "🚀 一键加载";
     });
   });
 

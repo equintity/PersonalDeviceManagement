@@ -61,13 +61,16 @@ def _get_json(url: str, payload: dict | None = None) -> dict | None:
 # 数据源
 # ---------------------------------------------------------------------------
 def fetch_lcsc_detail(code: str) -> dict | None:
-    """按 C 编号查询 → {price, currency, model, stock, cycle} 或 None。"""
+    """按 C 编号查询 → {price, currency, model, stock, cycle, name, category,
+    description, brand, package} 或 None。"""
     url = f"{LCSC_DETAIL_URL}?{urllib.parse.urlencode({'productCode': code})}"
     doc = _get_json(url)
     if not isinstance(doc, dict) or doc.get("code") != 200:
         return None
     d = doc.get("result") or {}
     price, currency = _lcsc_price(d.get("productPriceList"))
+    key_attrs = str(d.get("productKeyAttributes") or "")
+    name_en = str(d.get("productNameEn") or "")
     return {
         "price": price,
         "currency": currency,
@@ -76,6 +79,9 @@ def fetch_lcsc_detail(code: str) -> dict | None:
         "cycle": str(d.get("productCycle") or "normal")[:20],
         "brand": str(d.get("brandNameEn") or "")[:60],
         "package": str(d.get("encapStandard") or "")[:30],
+        "name": (key_attrs or name_en)[:64],
+        "category": str(d.get("catalogName") or d.get("parentCatalogName") or "")[:40],
+        "description": (key_attrs or name_en)[:200],
     }
 
 
