@@ -115,21 +115,27 @@ class TestSerialVirtual:
                          json={"port": "virtual://box"}).get_json()["data"]
         assert st["connected"] is True and st["virtual"] is True
 
-        # 模拟硬件按键取料 → 库存 -1
+        # T5 新语义:离线按键只改盒子,主机与 DB 不受影响
         client.post("/api/serial/simulate", json={"action": "take", "cell": 5})
+        client.post("/api/serial/simulate", json={"action": "take", "cell": 5})
+        client.post("/api/serial/simulate", json={"action": "return", "cell": 5})
+        d_mid = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d_mid["qty"] == 10                 # 离线按键不动 DB
+
+        # 重连 → 差异确认(以盒子为准)→ 库存联动(两次取料一次退料,净 0)
+        client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        diff = client.get("/api/serial/stock-diff").get_json()["data"]
+        assert diff["pending"] is True
+        r = client.post("/api/serial/stock-diff/apply", json={"resolution": "box"})
+        assert r.get_json()["data"]["applied"] == 1
         box = client.get("/api/box").get_json()["data"]
         mapped = next(m for m in box["mappings"] if m["cell"] == 5)
-        assert mapped["device"]["qty"] == 9
-
-        # 模拟退料 → 库存 +1
-        client.post("/api/serial/simulate", json={"action": "return", "cell": 5})
-        box = client.get("/api/box").get_json()["data"]
-        assert next(m for m in box["mappings"] if m["cell"] == 5)["device"]["qty"] == 10
+        assert mapped["device"]["qty"] == 9    # 两次取料一次退料,净 -1
 
         events = client.get("/api/serial/events?since=0").get_json()["data"]["events"]
         kinds = [(e["dir"], e["data"].get("evt") or e["data"].get("cmd")) for e in events]
-        assert ("out", "sync") in kinds           # 连接时自动推送了映射
-        assert ("in", "take") in kinds
+        assert ("out", "sync") in kinds           # 连接时自动推送了映射(两次连接均有)
         client.post("/api/serial/disconnect")
 
     def test_light_requires_connection(self, client):

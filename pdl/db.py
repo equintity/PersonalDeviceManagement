@@ -16,6 +16,15 @@ from pathlib import Path
 
 from .paths import as_data
 
+# T1/QA-01:schema 版本唯一真相(1=v1.0,2=价格列,3=deleted_at,4=冲销列)
+SCHEMA_VERSION = 4
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    """读 PRAGMA user_version;旧库 0 视为 1。"""
+    v = conn.execute("PRAGMA user_version").fetchone()[0]
+    return v if v else 1
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +92,8 @@ CREATE TABLE IF NOT EXISTS stock_moves (
     ref        TEXT NOT NULL DEFAULT '',
     cell       INTEGER,
     note       TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    reversed_move_id INTEGER           -- T2:冲销指向(NULL=未被冲销)
 );
 CREATE INDEX IF NOT EXISTS idx_moves_device ON stock_moves(device_id, id);
 
@@ -128,6 +138,9 @@ _MIGRATION_COLUMNS = {
         "price_source": "TEXT NOT NULL DEFAULT ''",     # lcsc / jlcpcb
         "deleted_at": "TEXT",                           # T-M1-03:软删除时间(NULL=在库)
     },
+    "stock_moves": {
+        "reversed_move_id": "INTEGER",                  # T2:冲销指向(NULL=未被冲销)
+    },
 }
 
 _connections: dict[tuple[int, str], sqlite3.Connection] = {}
@@ -171,14 +184,50 @@ def init_db(root) -> sqlite3.Connection:
     return conn
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """幂等的增量列迁移(PRAGMA table_info 检查后 ALTER TABLE)。"""
+def _migrate(conn: sqlite3.Connection) -> tuple[int, int]:
+    """T1:幂等增量列迁移 + user_version 版本化,返回 (from, to)。"""
+    from_version = schema_version(conn)
     for table, columns in _MIGRATION_COLUMNS.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for col, ddl in columns.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_moves_reversed"
+        " ON stock_moves(reversed_move_id) WHERE reversed_move_id IS NOT NULL")
+    to_version = SCHEMA_VERSION
+    if from_version >= 1 and from_version != to_version:
+        try:
+            conn.execute(
+                "INSERT INTO import_logs (kind, detail, imported, merged, skipped,"
+                " errors, created_at) VALUES ('migrate', ?, 0, 0, 0, '[]', ?)",
+                (f"schema {from_version} -> {to_version}", utc_now()))
+            conn.commit()
+        except sqlite3.Error:
+            pass
+    return from_version, to_version
+
+
+def migrate_db_file(path: Path) -> tuple[int, int]:
+    """T1:对磁盘上的独立数据库文件执行 schema+_migrate(备份恢复用)。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_SCHEMA)
+        versions = _migrate(conn)
+        conn.commit()
+        return versions
+    finally:
+        conn.close()
+
+
+def prune_backups(root, pattern: str, keep: int) -> None:
+    """按通配符清理备份目录,保留最近 keep 份。"""
+    bdir = as_data(root) / "data" / "backups"
+    files = sorted(bdir.glob(pattern))
+    for old in files[:-keep]:
+        old.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

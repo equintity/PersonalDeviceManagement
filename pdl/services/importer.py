@@ -50,6 +50,27 @@ _LCSC_FIELDS = ("category", "package", "manufacturer", "description")
 # ---------------------------------------------------------------------------
 # 途径 1:订单文件导入
 # ---------------------------------------------------------------------------
+def _lookup_batch(conn, key: str) -> dict | None:
+    """T-M2-01/T3:按幂等键查最近一次批次登记。"""
+    row = conn.execute(
+        "SELECT created_at, stats_json FROM import_batches WHERE idempotency_key = ?"
+        " ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        stats = json.loads(row["stats_json"] or "{}")
+    except ValueError:
+        stats = {}
+    return {"created_at": row["created_at"], "stats": stats}
+
+
+def _register_batch(conn, key: str, kind: str, source_name: str, stats_json: str) -> None:
+    conn.execute(
+        "INSERT INTO import_batches (idempotency_key, kind, source_name,"
+        " stats_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (key, kind, source_name, stats_json, utc_now()))
+
+
 def import_files(project_root, file_items: list[dict], *, fetch_details: bool = False,
                  force: bool = False) -> dict:
     """file_items: [{path, filename}]。返回汇总统计。
@@ -67,12 +88,9 @@ def import_files(project_root, file_items: list[dict], *, fetch_details: bool = 
     for item in file_items:
         digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
         key = f"file:{digest}"
-        prev = conn.execute(
-            "SELECT created_at, stats_json FROM import_batches WHERE idempotency_key = ?"
-            " ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        prev = _lookup_batch(conn, key)
         if prev:
-            keys[key] = {"source_name": item["filename"], "created_at": prev["created_at"],
-                         "stats": json.loads(prev["stats_json"] or "{}")}
+            keys[key] = {"source_name": item["filename"], **prev}
     if keys and not force:
         return {"duplicate": True,
                 "previous": list(keys.values()),
@@ -97,15 +115,11 @@ def import_files(project_root, file_items: list[dict], *, fetch_details: bool = 
 
     stats = _upsert_entries(project_root, entries, fetch_details=fetch_details,
                             kind="file", detail=",".join(i["filename"] for i in file_items))
-    now = utc_now()
     stats_json = json.dumps({"imported": stats["imported"], "merged": stats["merged"]},
                             ensure_ascii=False)
     for item in file_items:   # T-M2-01:所有成功导入的文件都登记批次(幂等键)
         digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
-        conn.execute(
-            "INSERT INTO import_batches (idempotency_key, kind, source_name,"
-            " stats_json, created_at) VALUES (?, 'file', ?, ?, ?)",
-            (f"file:{digest}", item["filename"], stats_json, now))
+        _register_batch(conn, f"file:{digest}", "file", item["filename"], stats_json)
     conn.commit()
     stats["errors"] = errors
     return stats
@@ -301,21 +315,23 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
         if qty <= 0:
             skipped += 1
             continue
-        try:
-            qty = security.validate_int(qty, field="数量", min_val=1, max_val=security.MAX_QTY)
-        except security.ValidationError:
-            skipped += 1
-            continue
         d = details.get(code, {})
         name = security.sanitize_text(d.get("name") or code, field="器件名",
                                       max_len=security.MAX_NAME_LEN) or code
+        # T4/QA-05:超限拒绝并报错(不静默夹值),错误含器件名与原始值
+        try:
+            qty = security.validate_qty(qty, field="数量")
+        except security.ValidationError as exc:
+            conn.rollback()
+            raise security.ValidationError(
+                f"器件「{name}」({code}) 导入数量 {qty}:{exc};导入已取消") from None
         row = conn.execute(
             "SELECT id, qty, deleted_at FROM devices WHERE lcsc_code = ?",
             (code,)).fetchone()
         if row and row["deleted_at"] is not None:
             # 曾被软删除:复活该行,库存以本次导入为准(而非累加进隐藏行)
             before = row["qty"]
-            after = min(security.MAX_QTY, max(qty, 0))
+            after = max(qty, 0)
             conn.execute(
                 "UPDATE devices SET deleted_at = NULL, qty = ?,"
                 " name = ?, category = ?, package = ?, manufacturer = ?,"
@@ -333,7 +349,12 @@ def _upsert_entries(project_root, entries: dict[str, int], *, fetch_details: boo
             imported += 1
         elif row:  # 在库:数量累加,补充缺失的详情(T-M1-01:同事务写流水)
             before = row["qty"]
-            after = min(security.MAX_QTY, before + qty)
+            after = before + qty
+            if after > security.MAX_QTY:
+                conn.rollback()
+                raise security.ValidationError(
+                    f"器件「{name}」({code}) 导入后库存将为 {after},"
+                    f"超出上限 {security.MAX_QTY}({security.MAX_QTY_REASON});导入已取消")
             conn.execute(
                 "UPDATE devices SET qty = ?,"
                 " category = CASE WHEN category = '' THEN ? ELSE category END,"
@@ -402,7 +423,7 @@ def row_to_device_plain(row) -> dict:
     return {c: ("" if d.get(c) is None else d.get(c)) for c in _CSV_COLUMNS}
 
 
-def import_csv(project_root, file_items: list[dict]) -> dict:
+def import_csv(project_root, file_items: list[dict], *, force: bool = False) -> dict:
     """导入本工具导出的全字段 CSV,字段白名单严格校验。"""
     all_entries: list[tuple[str, int]] = []
     for item in file_items:
@@ -415,26 +436,49 @@ def import_csv(project_root, file_items: list[dict]) -> dict:
             raise security.ValidationError(
                 f"{item['filename']}: 不是本工具导出的全字段 CSV(缺少 lcsc_code/name 列)")
         idx = {col: header.index(col) for col in _CSV_COLUMNS if col in header}
-        for row in rows[1:]:
+        for rowno, row in enumerate(rows[1:], start=2):
             get = lambda col: row[idx[col]] if col in idx and idx[col] < len(row) else ""
             code = security.validate_lcsc_code(get("lcsc_code"))
             name = security.validate_device_name(get("name") or code)
-            try:
-                qty = int(re.search(r"\d{1,7}", str(get("qty"))).group(0)) \
-                    if re.search(r"\d{1,7}", str(get("qty"))) else 1
-            except ValueError:
-                qty = 1
+            # T4/QA-05:数量解析健壮化 —— "1,000"→1000,小数四舍五入并把原文
+            # 记入 notes;解析失败/负数 → 400(文件名+行号+原文),删除 qty=1 静默兜底
+            raw_qty = str(get("qty")).strip()
+            cleaned = raw_qty.replace(",", "").replace("_", "").replace(" ", "")
+            note_extra = ""
+            if re.fullmatch(r"[0-9]+", cleaned):
+                qty = int(cleaned)
+                if cleaned != raw_qty:
+                    note_extra = f"数量原文:{raw_qty}"
+            elif re.fullmatch(r"[0-9]+\.[0-9]+", cleaned):
+                qty = round(float(cleaned))
+                note_extra = f"数量原文:{raw_qty}(四舍五入取整)"
+            else:
+                raise security.ValidationError(
+                    f"{item['filename']} 第 {rowno} 行数量无法识别:{raw_qty or '(空)'}")
             data = {
                 "lcsc_code": code, "name": name,
-                "qty": security.validate_int(qty, field="数量", min_val=0, max_val=security.MAX_QTY),
+                "qty": security.validate_qty(qty, field="数量"),
                 **{f: security.sanitize_text(get(f), max_len=security.MAX_TEXT_LEN)
                    for f in _LCSC_FIELDS + ("notes",)},
             }
+            if note_extra:
+                data["notes"] = (data["notes"] + "; " if data["notes"] else "") + note_extra
             all_entries.append((code, name, qty, data))
     if not all_entries:
         raise security.ValidationError("CSV 中没有有效数据行")
 
     conn = get_db(project_root)
+    # T3:内容幂等(按文件字节 sha256,不按文件名);重复默认拦截
+    duplicates: list[dict] = []
+    for item in file_items:
+        digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+        prev = _lookup_batch(conn, f"csv:{digest}")
+        if prev:
+            duplicates.append({"source_name": item["filename"], **prev})
+    if duplicates and not force:
+        return {"duplicate": True, "last": duplicates[0], "previous": duplicates,
+                "imported": 0, "merged": 0, "skipped": 0, "errors": []}
+
     imported = merged = 0
     now = utc_now()
     for code, name, qty, data in all_entries:
@@ -467,6 +511,11 @@ def import_csv(project_root, file_items: list[dict]) -> dict:
         " VALUES ('csv', ?, ?, ?, 0, '[]', ?)",
         (",".join(i["filename"] for i in file_items)[:200], imported, merged, now),
     )
+    stats_json = json.dumps({"imported": imported, "merged": merged},
+                            ensure_ascii=False)
+    for item in file_items:
+        digest = hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+        _register_batch(conn, f"csv:{digest}", "csv", item["filename"], stats_json)
     conn.commit()
     return {"imported": imported, "merged": merged, "skipped": 0, "errors": []}
 
@@ -546,7 +595,7 @@ def preview_codes(project_root, codes) -> dict:
     return {"items": items, "invalid": invalid_rows}
 
 
-def save_preview(project_root, items) -> dict:
+def save_preview(project_root, items, *, force: bool = False) -> dict:
     """阶段二:保存用户确认(且可能编辑过)的预览行。
 
     - new 行:全字段入库(再次过白名单/数值校验,不信任客户端);
@@ -558,7 +607,17 @@ def save_preview(project_root, items) -> dict:
     if len(items) > SAVE_MAX_ITEMS:
         raise security.ValidationError(f"单次保存最多 {SAVE_MAX_ITEMS} 件")
 
+    # T3:内容幂等 —— 按 code 排序的 code:qty:name 列表 + 总条数
+    canon_src = sorted(
+        (f"{i.get('code')}:{re.search(r'[0-9]+', str(i.get('qty') or 0)).group(0)}"
+         f":{i.get('name')}" if isinstance(i, dict) else str(i))
+        for i in items)
+    canonical = f"{len(items)}|" + ";".join(canon_src)
     conn = get_db(project_root)
+    prev = _lookup_batch(
+        conn, f"preview:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}")
+    if prev and not force:
+        return {"duplicate": True, "created": 0, "merged": 0, "last": prev}
     created = merged = 0
     failed: list[dict] = []
     now = utc_now()
@@ -574,10 +633,10 @@ def save_preview(project_root, items) -> dict:
             failed.append({"code": str(raw.get("code"))[:20], "error": "编号缺失或无效"})
             continue
         try:
-            qty = security.validate_int(
-                int(re.search(r"\d{1,7}", str(raw.get("qty") or "1")).group(0))
-                if re.search(r"\d{1,7}", str(raw.get("qty") or "1")) else 1,
-                field="库存数量", min_val=0, max_val=security.MAX_QTY)
+            qty = security.validate_qty(
+                int(re.search(r"[0-9]+", str(raw.get("qty") or "1")).group(0))
+                if re.search(r"[0-9]+", str(raw.get("qty") or "1")) else 1,
+                field="库存数量")
             fields = {
                 "name": security.sanitize_text(raw.get("name") or code,
                                                field="器件名",
@@ -663,5 +722,10 @@ def save_preview(project_root, items) -> dict:
         "INSERT INTO import_logs (kind, detail, imported, merged, skipped, errors, created_at)"
         " VALUES ('preview', 'C编号一键加载', ?, ?, ?, '[]', ?)",
         (created, merged, len(failed), now))
+    _register_batch(conn,
+                    f"preview:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}",
+                    "preview", "C 编号一键加载",
+                    json.dumps({"created": created, "merged": merged},
+                               ensure_ascii=False))
     conn.commit()
     return {"created": created, "merged": merged, "failed": failed}

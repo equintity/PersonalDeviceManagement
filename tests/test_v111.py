@@ -59,8 +59,9 @@ class TestD01ProtocolScale:
         client.post("/api/serial/disconnect")
 
     def test_sync_chunks_respect_line_limit(self, root):
-        """每帧 sync 都不超过 1024 字节协议上限。"""
-        bridge_items = [{"cell": i, "qty": 999999, "code": "C12345678"}
+        """每帧 sync(含 T8 name 字段)都不超过 1024 字节协议上限。"""
+        bridge_items = [{"cell": i, "qty": 999999, "code": "C12345678",
+                         "name": "二十字节名称测试ABCDEF"}      # T8:20 字节名称
                         for i in range(63)]
         chunks = [bridge_items[i:i + 8] for i in range(0, 63, 8)]
         assert len(chunks) == 8
@@ -151,11 +152,16 @@ class TestD03StockMoves:
         assert moves and moves[0]["source"] == "import" and moves[0]["after_qty"] == 1
 
     def test_box_take_move_records_cell(self, client):
+        """T5 新语义:simulate=离线按键;box_take 流水经差异确认(以盒子为准)产生。"""
         dev = device_create(client, "盒取件")
         client.post("/api/box/mapping", json={"cell": 5, "device_id": dev["id"]})
         client.post("/api/serial/connect", json={"port": "virtual://box"})
         client.post("/api/serial/simulate", json={"action": "take", "cell": 5})
         client.post("/api/serial/disconnect")
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        r = client.post("/api/serial/stock-diff/apply",
+                        json={"resolution": "box"}).get_json()["data"]
+        assert r["applied"] == 1
         moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
         assert moves[0]["source"] == "box_take" and moves[0]["cell"] == 5
 

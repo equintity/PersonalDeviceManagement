@@ -35,9 +35,10 @@
 | `info` | - | 回 `hello`(设备名/行列数/映射数) |
 | `light` | cell | 点亮指定格位(联动"点亮测试") |
 | `off` | - | 熄灭 |
-| `sync` | rows, cols, items[{cell, qty, code}] | 全量映射推送(连接时自动发送) |
+| `sync` | rows, cols, seq, total, items[{cell, qty, code, name}] | 全量映射分帧推送(≤8 项/帧;name=T8 名称下发,≤20 字节 UTF-8;末批同写 NVS 基线 b<cell>) |
 | `qty` | cell, qty | 单格库存回写(取料联动后) |
 | `take` | cell | 远程取料(软件按钮触发硬件同步) |
+| `stock` | - | T5:请求离线差异清单(相对上次 sync 基线 b<cell>),8 项/帧分帧返回 |
 
 ### 器件盒 → 上位机(事件)
 
@@ -49,8 +50,16 @@
 | `qty` | cell, qty | 库存变化回报 |
 | `cursor` | cell | 光标移动 |
 | `lit` | cell | 点亮确认 |
+| `stock` | seq, total, complete, items[{cell, qty, code}] | 离线差异分帧(末帧 complete:true;无差异回空 items 帧) |
 | `pong` | t | 心跳应答 |
 | `log` | msg | 提示消息(未知命令、库存为零等) |
+
+### 错误事件(log.msg)
+
+固件对异常输入回 `log` 事件而非静默丢弃:`json error`(解析失败)、
+`line too long, dropped`(超 1024B)、`bad cell` / `bad qty cmd`(越界)、
+`unknown cmd`、`config changed, stock reset`(T-M4-02 预留)。
+单帧上限 **1024 字节**(T-M4-01 由 512 提升以容纳分帧 sync)。
 
 ### 示例
 

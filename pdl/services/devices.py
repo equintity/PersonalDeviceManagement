@@ -9,7 +9,9 @@ import json
 import sqlite3
 
 from .. import security
-from ..db import get_db, row_to_device, utc_now
+import sqlite3
+
+from ..db import get_db, log_op, row_to_device, utc_now
 
 _DEVICE_FIELDS = ("category", "package", "manufacturer", "description", "notes")
 
@@ -103,7 +105,7 @@ def create_device(project_root, data: dict) -> dict:
     name = security.validate_device_name(data.get("name"))
     code = security.validate_lcsc_code(data.get("lcsc_code"))
     model = security.validate_model(data.get("model"))
-    qty = security.validate_int(data.get("qty", 0), field="库存数量", min_val=0, max_val=security.MAX_QTY)
+    qty = security.validate_qty(data.get("qty", 0))
     attrs = _validate_attrs(data.get("attrs"))
     price = _validate_price(data.get("price"))
     fields = {f: security.validate_str(data.get(f), field=f, max_len=security.MAX_TEXT_LEN)
@@ -166,8 +168,7 @@ def update_device(project_root, device_id: int, data: dict) -> dict:
         old_qty = conn.execute("SELECT qty FROM devices WHERE id = ?",
                                (device_id,)).fetchone()["qty"]
         updates.append("qty = ?")
-        params.append(security.validate_int(data.get("qty", 0), field="库存数量",
-                                            min_val=0, max_val=security.MAX_QTY))
+        params.append(security.validate_qty(data.get("qty", 0)))
     if "price" in data:
         updates.append("price = ?")
         params.append(_validate_price(data.get("price")))
@@ -235,17 +236,77 @@ def list_moves(project_root, device_id: int, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# qty 回写钩子:撤销后让器件盒同步(T2);由 create_app 注入桥接实现
+_qty_hooks: list = []
+
+
+def register_qty_hook(fn) -> None:
+    _qty_hooks.append(fn)
+
+
+def _notify_qty(project_root, cell, qty) -> None:
+    for fn in _qty_hooks:
+        try:
+            fn(project_root, cell, qty)
+        except Exception as exc:  # 推送失败只留痕,数据库是真相(T2 规格)
+            log_op(project_root, "fail", "stock.qty-push", f"cell={cell}: {exc}",
+                   ok=False)
+
+
 def undo_move(project_root, move_id: int) -> dict:
-    """T-M1-02:按反向 delta 撤销一条流水(写 undo 记录,不删除原记录)。"""
+    """T2/QA-02:按反向 delta 撤销一条流水(幂等)。
+
+    - 撤销记录(source=undo)不能再被撤销;
+    - 同一原流水只允许一条冲销(唯一索引 uq_moves_reversed 兜底并发);
+    - 重复撤销抛 ConflictError(409),qty 与流水条数不变;
+    - 与 qty 更新同事务(BEGIN IMMEDIATE),成功后通知盒子回写。
+    """
     move_id = security.validate_int(move_id, field="流水ID", min_val=1, max_val=2**31 - 1)
     conn = get_db(project_root)
-    move = conn.execute("SELECT * FROM stock_moves WHERE id = ?", (move_id,)).fetchone()
-    if move is None:
-        raise security.ValidationError(f"流水不存在:id={move_id}")
-    updated = adjust_qty(project_root, move["device_id"], -move["delta"],
-                         source="undo", cell=move["cell"],
-                         note=f"撤销流水#{move['id']}")
-    return {"move_id": move_id, "device": updated}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        move = conn.execute("SELECT * FROM stock_moves WHERE id = ?",
+                            (move_id,)).fetchone()
+        if move is None:
+            conn.rollback()
+            raise security.ValidationError(f"流水不存在:id={move_id}")
+        if move["source"] == "undo":
+            conn.rollback()
+            raise security.ConflictError("撤销记录不能再被撤销")
+        dup = conn.execute(
+            "SELECT 1 FROM stock_moves WHERE reversed_move_id = ?",
+            (move_id,)).fetchone()
+        if dup:
+            conn.rollback()
+            raise security.ConflictError("该变动已撤销,不能重复撤销")
+        dev = conn.execute("SELECT qty FROM devices WHERE id = ?",
+                           (move["device_id"],)).fetchone()
+        if dev is None:
+            conn.rollback()
+            raise security.ValidationError(f"器件不存在:id={move['device_id']}")
+        before = dev["qty"]
+        after = max(0, min(security.MAX_QTY, before - move["delta"]))
+        conn.execute("UPDATE devices SET qty = ?, updated_at = ? WHERE id = ?",
+                     (after, utc_now(), move["device_id"]))
+        conn.execute(
+            "INSERT INTO stock_moves (device_id, delta, before_qty, after_qty,"
+            " source, ref, cell, note, created_at, reversed_move_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (move["device_id"], -move["delta"], before, after, "undo",
+             f"undo:{move_id}", move["cell"],
+             f"撤销流水#{move_id}", utc_now(), move_id))
+        conn.commit()
+    except security.ConflictError:
+        raise
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        raise security.ConflictError("该变动已撤销(并发请求)") from None
+    except Exception:
+        conn.rollback()
+        raise
+    if move["cell"] is not None:
+        _notify_qty(project_root, move["cell"], after)
+    return {"move_id": move_id, "device": get_device(project_root, move["device_id"])}
 
 
 def _write_move(conn, device_id: int, delta: int, before: int, after: int, *,

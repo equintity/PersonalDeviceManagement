@@ -19,9 +19,35 @@ namespace app {
 
 static int32_t s_qty[BOX_CELLS];      // 每格库存,-1 = 未映射
 static uint16_t s_cursor = 0;
+// T8:格位名称缓存(RAM = BOX_CELLS*21 ≈ 1323B);每次 sync 下发,掉电丢失,
+// 为空时回退编译期 BOX_MAPPINGS[].name(不写 NVS —— 名称是易变展示数据)
+static char s_name[BOX_CELLS][21];
+
+// UTF-8 安全拷贝:≤20 字节且不切断多字节字符
+static void name_copy(char* dst, const char* src, size_t cap) {
+    size_t n = strlen(src);
+    if (n > cap - 1) n = cap - 1;
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 int32_t qty_of(uint16_t cell) {
     return cell < BOX_CELLS ? s_qty[cell] : -1;
+}
+
+// T5/QA-04:sync 基线(b<cell>)——host 下发的值;按键/qty 只改 q
+uint32_t base_of(uint16_t cell) {
+    uint32_t b = storage::load_base(cell, 0xFFFF);
+    if (b == 0xFFFF) {                       // 首次无基线:视为与 q 一致
+        b = storage::load_qty(cell, 0);
+        storage::save_base(cell, b);
+    }
+    return b;
+}
+
+void set_base(uint16_t cell, uint32_t qty) {
+    storage::save_base(cell, qty);
 }
 
 static int mapping_index(uint16_t cell) {
@@ -46,6 +72,18 @@ void remote_light(int16_t cell) {
     led_matrix::set_lit(cell);
 }
 
+// T8:sync 下发的名称;空串不覆盖已有值
+void set_name(uint16_t cell, const char* name) {
+    if (cell >= BOX_CELLS || name == nullptr || name[0] == '\0') return;
+    name_copy(s_name[cell], name, 21);
+}
+
+const char* name_of(uint16_t cell) {
+    if (cell < BOX_CELLS && s_name[cell][0] != '\0') return s_name[cell];
+    const int idx = mapping_index(cell);
+    return idx >= 0 ? BOX_MAPPINGS[idx].name : "";
+}
+
 static void render_current() {
     const uint16_t cell = s_cursor;
     const int idx = mapping_index(cell);
@@ -53,7 +91,7 @@ static void render_current() {
         box_ui::show_cell(cell, "", "", 0, false);
         return;
     }
-    box_ui::show_cell(cell, BOX_MAPPINGS[idx].code, BOX_MAPPINGS[idx].name,
+    box_ui::show_cell(cell, BOX_MAPPINGS[idx].code, name_of(cell),
                       s_qty[cell], true);
 }
 
@@ -117,6 +155,13 @@ void setup() {
         if (cell < BOX_CELLS) {
             app::s_qty[cell] = static_cast<int32_t>(
                 storage::load_qty(cell, BOX_MAPPINGS[i].qty));
+        }
+    }
+    // T5:首次使用(无 b<cell> 基线)时 b := q,避免首次连接全员误报差异
+    for (int i = 0; i < MAPPING_COUNT; i++) {
+        const uint16_t cell = BOX_MAPPINGS[i].cell;
+        if (cell < BOX_CELLS && !storage::has_base(cell)) {
+            storage::save_base(cell, static_cast<uint32_t>(app::s_qty[cell]));
         }
     }
 

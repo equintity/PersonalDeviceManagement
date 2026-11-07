@@ -36,6 +36,9 @@ _HEADER_TEMPLATE = """\
 // ===========================================================================
 #pragma once
 
+// ---- 库存上限(与主机 security.MAX_QTY 一致) ----
+#define BOX_MAX_QTY         65535
+
 // ---- 格栅布局(需求 3:尺寸可动态配置) ----
 #define BOX_ROWS            {rows}
 #define BOX_COLS            {cols}
@@ -94,6 +97,17 @@ def render_box_config_header(project_root) -> str:
            for k in ("btn_up", "btn_down", "btn_left", "btn_right", "btn_ok")}
     sda = security.c_int(cfg["oled_sda"], min_val=0, max_val=48, field="SDA")
     scl = security.c_int(cfg["oled_scl"], min_val=0, max_val=48, field="SCL")
+
+    # T4/QA-05:历史脏数据(>65535)不允许静默截断,拒绝生成并点名器件
+    overs = [(m["device"]["name"], m["device"]["qty"])
+             for m in box["mappings"]
+             if m["device"] and (m["device"]["qty"] or 0) > security.MAX_QTY]
+    if overs:
+        listing = ", ".join(f"「{security.sanitize_text(n, max_len=40)}」({q})"
+                            for n, q in overs)
+        raise security.ValidationError(
+            f"以下器件库存超出固件上限 {security.MAX_QTY}({security.MAX_QTY_REASON}),"
+            f"已拒绝生成,请先修正库存:{listing}")
 
     lines: list[str] = []
     for m in box["mappings"]:
