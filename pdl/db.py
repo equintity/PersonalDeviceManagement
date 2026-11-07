@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS stock_moves (
     ref        TEXT NOT NULL DEFAULT '',
     cell       INTEGER,
     note       TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    reversed_move_id INTEGER           -- T2:冲销指向(NULL=未被冲销)
 );
 CREATE INDEX IF NOT EXISTS idx_moves_device ON stock_moves(device_id, id);
 
@@ -136,6 +137,9 @@ _MIGRATION_COLUMNS = {
         "price_updated_at": "TEXT",                     # 最近一次价格刷新时间(UTC)
         "price_source": "TEXT NOT NULL DEFAULT ''",     # lcsc / jlcpcb
         "deleted_at": "TEXT",                           # T-M1-03:软删除时间(NULL=在库)
+    },
+    "stock_moves": {
+        "reversed_move_id": "INTEGER",                  # T2:冲销指向(NULL=未被冲销)
     },
 }
 
@@ -190,6 +194,9 @@ def _migrate(conn: sqlite3.Connection) -> tuple[int, int]:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_moves_reversed"
+        " ON stock_moves(reversed_move_id) WHERE reversed_move_id IS NOT NULL")
     to_version = SCHEMA_VERSION
     if from_version >= 1 and from_version != to_version:
         try:

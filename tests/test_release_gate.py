@@ -4,6 +4,12 @@
 """
 
 
+def device_create(client, name, **kw):
+    resp = client.post("/api/devices", json={"name": name, "qty": 10, **kw})
+    assert resp.status_code == 201
+    return resp.get_json()["data"]
+
+
 def _zip_backup(tmp_path, db_bytes: bytes, manifest: dict) -> bytes:
     import io
     import zipfile
@@ -134,3 +140,86 @@ class TestBackupMigration:
                            data={"file": (_io.BytesIO(blob), "backup.zip")})
         assert resp.status_code == 200
         assert resp.get_json()["data"]["from_schema"] == 1
+
+
+class TestUndoIdempotency:
+    """T2/QA-02:同一变动不可被重复冲销;并发撤销恰好一次生效。"""
+
+    import threading
+
+    def _setup(self, client):
+        dev = client.post("/api/devices",
+                          json={"name": "撤销件", "qty": 10}).get_json()["data"]
+        client.post(f"/api/devices/{dev['id']}/adjust-qty", json={"delta": -3})
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        return dev, moves[0]["id"]
+
+    def test_undo_once(self, client):
+        dev, move_id = self._setup(client)
+        resp = client.post(f"/api/moves/{move_id}/undo")
+        assert resp.status_code == 200
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 10                                   # 10 → 7 → 10
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert len(moves) == 2 and moves[0]["source"] == "undo"
+        undo_row = moves[0]
+        assert undo_row["reversed_move_id"] == move_id
+
+    def test_double_undo_conflict_409(self, client):
+        dev, move_id = self._setup(client)
+        client.post(f"/api/moves/{move_id}/undo")
+        resp = client.post(f"/api/moves/{move_id}/undo")
+        assert resp.status_code == 409                          # 当前 bug:qty 变 11
+        assert "已撤销" in resp.get_json()["error"]
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 10
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert len(moves) == 2                                  # 流水仍 2 条
+
+    def test_undo_of_undo_conflict(self, client):
+        dev, move_id = self._setup(client)
+        client.post(f"/api/moves/{move_id}/undo")
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        undo_id = moves[0]["id"]
+        resp = client.post(f"/api/moves/{undo_id}/undo")
+        assert resp.status_code == 409                          # 撤销记录不可再撤
+
+    def test_concurrent_undo_exactly_once(self, client):
+        import threading
+        dev, move_id = self._setup(client)
+        results = []
+
+        app = client.application
+
+        def worker():
+            with app.test_client() as c:      # 每线程独立 client(上下文隔离)
+                r = c.post(f"/api/moves/{move_id}/undo")
+                results.append(r.status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results.count(200) == 1 and results.count(409) == 4
+        d = client.get(f"/api/devices/{dev['id']}").get_json()["data"]
+        assert d["qty"] == 10
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        assert len([m for m in moves if m["source"] == "undo"]) == 1
+
+    def test_undo_pushes_qty_to_box(self, client):
+        """撤销带 cell 的流水(box_take)→ 盒子收到 qty 回写。"""
+        dev = device_create(client, "盒撤件")
+        client.post("/api/box/mapping", json={"cell": 0, "device_id": dev["id"]})
+        client.post("/api/serial/connect", json={"port": "virtual://box"})
+        client.post("/api/serial/simulate", json={"action": "take", "cell": 0})
+        moves = client.get(f"/api/devices/{dev['id']}/moves").get_json()["data"]
+        take_move = next(m for m in moves if m["source"] == "box_take")
+        since = client.get("/api/serial/events?since=0").get_json()["data"]["events"]
+        since = since[-1]["id"] if since else 0
+        client.post(f"/api/moves/{take_move['id']}/undo")
+        events = client.get(f"/api/serial/events?since={since}").get_json()["data"]["events"]
+        qty_cmds = [e for e in events if e["dir"] == "out"
+                    and e["data"].get("cmd") == "qty"]
+        assert qty_cmds and qty_cmds[-1]["data"]["qty"] == 10   # 9 回退到 10
+        client.post("/api/serial/disconnect")

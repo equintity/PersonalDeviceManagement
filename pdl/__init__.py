@@ -9,7 +9,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from . import security
 from .db import db_path, get_db, init_db, log_op
 from .paths import AppPaths, as_resources
-from .services import boxmap
+from .services import boxmap, devices
 from .services.serial_bridge import SerialBridge
 
 APP_VERSION = "1.1.1"
@@ -30,7 +30,6 @@ _SECURITY_HEADERS = {
 # 仅允许的本机主机名(DNS rebinding 防护)
 _LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 
-_sync_hook_registered = False
 
 
 def _host_hostname(host: str) -> str:
@@ -87,14 +86,21 @@ def create_app(project_root: str | Path | None = None, *,
     })
     app.register_blueprint(bp)
 
-    # 映射变化 → 自动推送 sync 到已连接的器件盒(联动)
-    global _sync_hook_registered
-    if not _sync_hook_registered:
-        def _push_sync(_paths):
-            if bridge.connected:
-                bridge.push_sync()
-        boxmap.register_sync_hook(_push_sync)
-        _sync_hook_registered = True
+    # 映射/库存变化 → 自动推送到已连接的器件盒(联动)。
+    # 每次 create_app 注册当前实例的钩子;测试多实例时旧钩子自然失效(桥已断开)。
+    def _push_sync(_paths):
+        if not bridge.connected:
+            return {"sent": False, "reason": "器件盒未连接"}
+        ok = bridge.push_sync()
+        return {"sent": bool(ok), "reason": "" if ok else "推送失败(串口写入异常)"}
+
+    def _qty_push(_root, cell, qty):
+        # T2:撤销后把盒子该格 qty 同步回退(失败由 _notify_qty 留痕)
+        if bridge.connected and cell is not None:
+            bridge.send_command("qty", cell=cell, qty=qty)
+
+    boxmap.register_sync_hook(_push_sync)
+    devices.register_qty_hook(_qty_push)
 
     @app.get("/")
     def index():
@@ -131,6 +137,15 @@ def create_app(project_root: str | Path | None = None, *,
             if o_host not in _LOCAL_HOSTNAMES:
                 return jsonify({"ok": False, "error": "已拒绝跨源写请求"}), 403
         return None
+
+    @app.errorhandler(security.ConflictError)
+    def on_conflict_error(exc):
+        try:
+            if request.method == "POST" and request.path.startswith("/api"):
+                log_op(paths, "fail", request.path, str(exc), ok=False)
+        except Exception:  # 日志失败不影响错误响应
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 409
 
     @app.errorhandler(security.ValidationError)
     def on_validation_error(exc):
